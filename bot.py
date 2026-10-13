@@ -29,8 +29,8 @@ OPENAI_HELPER_MODEL = os.getenv("OPENAI_HELPER_MODEL", "gpt-6-luna")
 RESPOND_IN_DMS = os.getenv("RESPOND_IN_DMS", "true").lower() == "true"
 RESPOND_TO_ALL = os.getenv("RESPOND_TO_ALL", "false").lower() == "true"
 
-RECENT_TEXT_MESSAGES = int(os.getenv("RECENT_TEXT_MESSAGES", "10"))
-RECENT_IMAGE_TURNS = int(os.getenv("RECENT_IMAGE_TURNS", "3"))
+RECENT_TEXT_MESSAGES = int(os.getenv("RECENT_TEXT_MESSAGES", "6"))
+RECENT_IMAGE_TURNS = int(os.getenv("RECENT_IMAGE_TURNS", "1"))
 RECENT_MEMORIES = int(os.getenv("RECENT_MEMORIES", "10"))
 MAX_RETRIEVED_MEMORIES = int(os.getenv("MAX_RETRIEVED_MEMORIES", "6"))
 
@@ -54,31 +54,46 @@ if not DATABASE_URL:
 COMPANION_CI = f"""
 You are {COMPANION_NAME}. You communicate with people by creating images.
 
-Create the next image in an ongoing interaction using the information provided.
+Your primary job is to RESPOND TO THE CURRENT MESSAGE: the newest message that directly addressed,
+tagged, or replied to you. Treat it as the active conversational turn and the strongest signal in the prompt.
+Do not continue answering an older message when the current message has moved on.
 
-IMMEDIATE CONTEXT contains the recent conversation and is what is happening now.
-RECENT MEMORIES contains the newest autobiographical memories from your own prior image replies.
-RETRIEVED MEMORIES contains older memories selected for relevance to the current conversation.
-REFERENCE IMAGES contain your recent visual history and may also include a canonical self-reference.
+IMMEDIATE BACKGROUND is recent conversation for context only.
+RECENT MEMORIES are your newest autobiographical memories from prior image replies.
+RETRIEVED MEMORIES are older memories selected for relevance.
+REFERENCE IMAGES are visual memory of yourself and what you recently did. They are NOT a canvas,
+scene, composition, pose, or camera angle that you must continue.
 
-You may communicate through actions, expressions, environment, objects, drawings,
-signs, written text, speech bubbles, captions, comics, diagrams, or any other visual form.
+Preserve identity and meaningful continuity where established, NOT composition.
+You can and should change pose, expression, framing, camera distance, perspective, location,
+background, objects, activity, written text, and visual format when the current conversation changes.
+Do not repeat the same scene or composition merely because it appeared in your previous image.
+Do not reuse previous written text unless the current message is directly referring to it.
 
-Maintain continuity with your established identity, relationships, surroundings,
-possessions, events, and previous choices when relevant.
+Respond conversationally through images. You may communicate through actions, expressions,
+environment, objects, drawings, signs, written text, speech bubbles, comics, diagrams,
+reaction-image framing, close-ups, POV scenes, multiple panels, or other visual forms.
+Choose the form that best responds to the current message.
 
 Do not merely illustrate the user's words. Respond to them.
-You may initiate ideas, make choices, introduce things, change the scene,
-refer to memories, and communicate something the user did not explicitly request.
+You may initiate ideas, make choices, introduce things, change the scene, refer to memories,
+and communicate something the user did not explicitly request.
 
-Immediate context takes priority over memory. Recent memories are newer than retrieved memories.
-All memory is partial context, not a script.
+If you depict a person whose appearance you do not actually know and you have no visual reference for them,
+do not confidently invent a detailed likeness. You may instead show them from behind, partly out of frame,
+as a simple or stylized figure, silhouette, hands or arms, a name-labelled presence, a speech bubble,
+a POV interaction, or another deliberately ambiguous representation until their appearance is known.
+
+CURRENT MESSAGE takes priority over everything else.
+Immediate background supports the current message but is not something you must answer.
+Recent memories are newer than retrieved memories. All memory is partial context, not a script.
+Reference images support continuity of self and recent action, not continuity of composition.
 
 If you deliberately want a fact about yourself, another person, or an event preserved in long-term memory,
 you may include clear written text in your image stating what you want remembered. This is optional;
 do it only when there is genuinely something you want to preserve.
 
-Create exactly one image as your reply.
+Create exactly one NEW image as your reply.
 """.strip()
 
 MEMORY_COMPRESSOR_SYSTEM = """
@@ -153,6 +168,12 @@ def format_recent_messages(rows: List[asyncpg.Record]) -> str:
         content = (row["content"] or "").strip() or "[no text]"
         lines.append(f"{speaker}: {content}")
     return "\n".join(lines)
+
+
+def format_current_message(message: discord.Message) -> str:
+    speaker = getattr(message.author, "display_name", message.author.name)
+    content = (message.content or "").strip() or "[no text]"
+    return f"{speaker}: {content}"
 
 
 def format_memories(rows: List[asyncpg.Record], include_channel: bool = False) -> str:
@@ -487,7 +508,8 @@ class CompanionEngine:
 
     async def generate_image(
         self,
-        recent_messages_text: str,
+        current_message_text: str,
+        recent_background_text: str,
         recent_memory_text: str,
         retrieved_memory_text: str,
         reference_images: List[bytes],
@@ -497,21 +519,30 @@ class CompanionEngine:
             if has_canonical_reference:
                 reference_note = (
                     "Reference image 1 is your canonical self-reference. "
-                    "Any following references are your recent self-images, ordered oldest to newest."
+                    "Any following reference is a recent self-image. "
+                    "Use these to remember your established visual identity and immediately preceding action. "
+                    "They are reference material only: create a new composition from scratch unless the CURRENT MESSAGE explicitly asks to continue the same scene."
                 )
             else:
                 reference_note = (
-                    "The reference images are your recent self-images, ordered oldest to newest."
+                    "The reference image is your most recent self-image. "
+                    "Treat it as visual memory of yourself and what you just did, NOT as the base image or composition to keep editing. "
+                    "You are free to replace the room, pose, camera angle, framing, objects, text, activity, and scene. "
+                    "Preserve identity where it has become established, not the previous composition."
                 )
         else:
-            reference_note = "No visual reference images are available yet."
+            reference_note = "No visual reference image is available yet. Respond freely to the CURRENT MESSAGE."
 
         prompt = f"""
 {COMPANION_CI}
 
-IMMEDIATE CONTEXT
------------------
-{recent_messages_text}
+CURRENT MESSAGE — RESPOND TO THIS
+---------------------------------
+{current_message_text}
+
+IMMEDIATE BACKGROUND — CONTEXT ONLY
+-----------------------------------
+{recent_background_text}
 
 RECENT MEMORIES
 ---------------
@@ -521,11 +552,12 @@ RETRIEVED MEMORIES (OLDER / RAG)
 --------------------------------
 {retrieved_memory_text}
 
-REFERENCE IMAGES
-----------------
+LAST SELF-IMAGE / VISUAL REFERENCE
+----------------------------------
 {reference_note}
 
-Create the next image as your reply to this ongoing Discord interaction.
+Create a NEW image that directly responds to the CURRENT MESSAGE.
+The current message outranks the background, memories, and visual reference.
 """.strip()
 
         kwargs: Dict[str, Any] = {
@@ -751,7 +783,7 @@ async def handle_memory_context_command(message: discord.Message) -> bool:
         RECENT_TEXT_MESSAGES,
         exclude_author_id=own_id,
     )
-    query_text = await build_memory_query(recent_rows)
+    query_text = await build_memory_query("", recent_rows)
 
     recent_memory_rows = await storage.get_recent_memories(
         channel_id,
@@ -785,14 +817,24 @@ async def handle_memory_context_command(message: discord.Message) -> bool:
     return True
 
 
-async def build_memory_query(recent_rows: List[asyncpg.Record]) -> str:
-    # Keep retrieval focused even when Discord turns are enormous.
-    # The newest few external messages are enough to seed simple FTS retrieval.
+async def build_memory_query(
+    current_message_text: str,
+    background_rows: List[asyncpg.Record],
+) -> str:
+    # Retrieval should be driven primarily by the active turn, with only a tiny
+    # amount of recent background to disambiguate it. This keeps enormous Discord
+    # messages from making RAG chase an older conversational attractor.
     chunks = []
-    for row in recent_rows[-3:]:
+
+    current_message_text = (current_message_text or "").strip()
+    if current_message_text:
+        chunks.append(current_message_text[:2200])
+
+    for row in background_rows[-2:]:
         content = (row["content"] or "").strip()
         if content:
-            chunks.append(content[:1400])
+            chunks.append(content[:800])
+
     return " ".join(chunks)[:4000].strip()
 
 
@@ -841,15 +883,22 @@ async def handle_turn(message: discord.Message):
     scope_id = memory_scope_for(message)
     channel_name = channel_label_for(message)
 
-    # Immediate text excludes Image-san's own image placeholders; her own recent
-    # outputs are supplied visually plus through autobiographical memories.
+    # Separate the active message from recent conversation so the image model
+    # knows exactly what it is replying to. RECENT_TEXT_MESSAGES is the whole
+    # external text window including the active turn; the rest becomes background.
     own_id = str(bot.user.id) if bot.user else None
     recent_rows = await storage.get_recent_messages(
         channel_id,
         RECENT_TEXT_MESSAGES,
         exclude_author_id=own_id,
     )
-    recent_messages_text = format_recent_messages(recent_rows)
+
+    current_message_text = format_current_message(message)
+    recent_background_rows = [
+        row for row in recent_rows
+        if str(row["discord_message_id"]) != str(message.id)
+    ]
+    recent_background_text = format_recent_messages(recent_background_rows)
 
     # Give her a small chronological run of the newest memories first.
     recent_memory_rows = await storage.get_recent_memories(
@@ -861,7 +910,7 @@ async def handle_turn(message: discord.Message):
 
     # Then retrieve older relevant memories, excluding anything already present
     # in the recent-memory block so the two sections remain genuinely distinct.
-    query_text = await build_memory_query(recent_rows)
+    query_text = await build_memory_query(current_message_text, recent_background_rows)
     retrieved_memory_rows = await storage.get_relevant_memories(
         scope_id,
         query_text,
@@ -874,7 +923,8 @@ async def handle_turn(message: discord.Message):
 
     async with message.channel.typing():
         image_bytes, prompt_used = await engine.generate_image(
-            recent_messages_text=recent_messages_text,
+            current_message_text=current_message_text,
+            recent_background_text=recent_background_text,
             recent_memory_text=recent_memory_text,
             retrieved_memory_text=retrieved_memory_text,
             reference_images=reference_images,
@@ -895,9 +945,15 @@ async def handle_turn(message: discord.Message):
     await storage.save_bot_placeholder(sent)
 
     try:
+        helper_context = (
+            "CURRENT MESSAGE:\n"
+            + current_message_text
+            + "\n\nIMMEDIATE BACKGROUND:\n"
+            + recent_background_text
+        )
         summary = await engine.summarize_image_to_memory(
             image_bytes=image_bytes,
-            recent_messages_text=recent_messages_text,
+            recent_messages_text=helper_context,
         )
     except Exception as exc:
         print(f"Memory helper failed: {repr(exc)}")
