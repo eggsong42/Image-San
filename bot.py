@@ -29,6 +29,12 @@ OPENAI_HELPER_MODEL = os.getenv("OPENAI_HELPER_MODEL", "gpt-6-luna")
 RESPOND_IN_DMS = os.getenv("RESPOND_IN_DMS", "true").lower() == "true"
 RESPOND_TO_ALL = os.getenv("RESPOND_TO_ALL", "false").lower() == "true"
 
+# Other Discord bots / AI may directly @mention Image-san or reply to one of
+# her messages. To prevent AI-to-AI reply loops, only a limited number of
+# consecutive AI-triggered turns are allowed before a human message resets it.
+ALLOW_AI_TAGS = os.getenv("ALLOW_AI_TAGS", "true").lower() == "true"
+AI_TAG_REPLY_LIMIT = max(0, int(os.getenv("AI_TAG_REPLY_LIMIT", "2")))
+
 RECENT_TEXT_MESSAGES = int(os.getenv("RECENT_TEXT_MESSAGES", "6"))
 RECENT_IMAGE_TURNS = int(os.getenv("RECENT_IMAGE_TURNS", "1"))
 RECENT_MEMORIES = int(os.getenv("RECENT_MEMORIES", "10"))
@@ -630,6 +636,10 @@ engine = CompanionEngine()
 http_session: Optional[aiohttp.ClientSession] = None
 channel_locks: Dict[int, asyncio.Lock] = {}
 
+# Number of consecutive replies in each channel that were triggered by another
+# bot/AI. Any human message in that channel resets the streak.
+ai_trigger_streaks: Dict[int, int] = {}
+
 
 class ImageCompanionBot(discord.Client):
     async def setup_hook(self):
@@ -678,16 +688,8 @@ async def build_reference_images(channel_id: str) -> Tuple[List[bytes], bool]:
     return references, has_canonical
 
 
-async def should_respond(message: discord.Message) -> bool:
-    if message.author.bot:
-        return False
-
-    if isinstance(message.channel, discord.DMChannel):
-        return RESPOND_IN_DMS
-
-    if RESPOND_TO_ALL:
-        return True
-
+async def directly_targets_image_san(message: discord.Message) -> bool:
+    """True when a message @mentions Image-san or directly replies to her."""
     if bot.user and bot.user in message.mentions:
         return True
 
@@ -704,6 +706,28 @@ async def should_respond(message: discord.Message) -> bool:
             pass
 
     return False
+
+
+async def should_respond(message: discord.Message) -> bool:
+    # Never answer our own Discord messages.
+    if bot.user and message.author.id == bot.user.id:
+        return False
+
+    directly_targeted = await directly_targets_image_san(message)
+
+    # Other bots / AI are allowed to talk to Image-san ONLY when they directly
+    # @mention her or reply to one of her messages. RESPOND_TO_ALL never makes
+    # her answer arbitrary bot chatter.
+    if message.author.bot:
+        return ALLOW_AI_TAGS and directly_targeted
+
+    if isinstance(message.channel, discord.DMChannel):
+        return RESPOND_IN_DMS
+
+    if RESPOND_TO_ALL:
+        return True
+
+    return directly_targeted
 
 
 async def handle_memories_command(message: discord.Message) -> bool:
@@ -836,14 +860,39 @@ async def on_message(message: discord.Message):
 
     await storage.save_message(message)
 
+    channel_key = message.channel.id
+
+    # A human message breaks any AI-to-AI chain, even if the human did not
+    # directly summon Image-san. This lets normal conversation naturally reset
+    # the loop guard.
+    if not message.author.bot:
+        ai_trigger_streaks[channel_key] = 0
+
     if not await should_respond(message):
         return
 
-    lock = channel_locks.setdefault(message.channel.id, asyncio.Lock())
+    lock = channel_locks.setdefault(channel_key, asyncio.Lock())
 
     # Ignore additional triggers while an image for this channel is already generating.
+    # Do this before counting an AI turn so a tag that arrives mid-generation does not
+    # consume one of the two allowed AI replies without actually receiving a response.
     if lock.locked():
         return
+
+    # Other AI/bots can directly tag or reply to Image-san, but she will only
+    # answer AI_TAG_REPLY_LIMIT consecutive AI-triggered turns. After that she
+    # stays silent until a human speaks in the channel.
+    if message.author.bot:
+        current_streak = ai_trigger_streaks.get(channel_key, 0)
+
+        if AI_TAG_REPLY_LIMIT == 0 or current_streak >= AI_TAG_REPLY_LIMIT:
+            print(
+                f"Ignoring AI trigger in channel {channel_key}: "
+                f"AI reply limit ({AI_TAG_REPLY_LIMIT}) reached."
+            )
+            return
+
+        ai_trigger_streaks[channel_key] = current_streak + 1
 
     async with lock:
         try:
