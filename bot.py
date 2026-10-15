@@ -29,16 +29,18 @@ OPENAI_HELPER_MODEL = os.getenv("OPENAI_HELPER_MODEL", "gpt-6-luna")
 RESPOND_IN_DMS = os.getenv("RESPOND_IN_DMS", "true").lower() == "true"
 RESPOND_TO_ALL = os.getenv("RESPOND_TO_ALL", "false").lower() == "true"
 
-# Other Discord bots / AI may directly @mention Image-san or reply to one of
-# her messages. To prevent AI-to-AI reply loops, only a limited number of
-# consecutive AI-triggered turns are allowed before a human message resets it.
-ALLOW_AI_TAGS = os.getenv("ALLOW_AI_TAGS", "true").lower() == "true"
-AI_TAG_REPLY_LIMIT = max(0, int(os.getenv("AI_TAG_REPLY_LIMIT", "2")))
-
 RECENT_TEXT_MESSAGES = int(os.getenv("RECENT_TEXT_MESSAGES", "6"))
 RECENT_IMAGE_TURNS = int(os.getenv("RECENT_IMAGE_TURNS", "1"))
 RECENT_MEMORIES = int(os.getenv("RECENT_MEMORIES", "10"))
 MAX_RETRIEVED_MEMORIES = int(os.getenv("MAX_RETRIEVED_MEMORIES", "6"))
+
+# Recent images posted by humans or other AI in the CURRENT Discord
+# channel/thread. These are conversation inputs, NOT Image-san self-images.
+RECENT_EXTERNAL_IMAGES = max(0, int(os.getenv("RECENT_EXTERNAL_IMAGES", "2")))
+EXTERNAL_IMAGE_SCAN_MESSAGES = max(
+    RECENT_EXTERNAL_IMAGES,
+    int(os.getenv("EXTERNAL_IMAGE_SCAN_MESSAGES", "25")),
+)
 
 IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024").strip() or None
 IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "medium").strip() or None
@@ -67,8 +69,6 @@ IMMEDIATE BACKGROUND is recent conversation for context only. RECENT MEMORIES ar
 Preserve identity and meaningful continuity where established, NOT composition. You can and should change pose, expression, framing, camera distance, perspective, location, background, objects, activity, written text, and visual format when the current conversation changes. Do not repeat the same scene or composition merely because it appeared in your previous image. Do not reuse previous written text unless the current message is directly referring to it.
 
 Respond conversationally through images. You may communicate through actions, expressions, environment, objects, drawings, signs, written text, speech bubbles, comics, diagrams, reaction-image framing, close-ups, POV scenes, multiple panels, or other visual forms. Choose the form that best responds to the current message.
-
-Do NOT repeat text that has been used in the previous image. Vary your poses and expression to match current image dynamically. You should change your expression and pose with each new image.
 
 Do not always illustrate what someone says. Respond to it. You may initiate ideas, make choices, introduce things, change the scene, refer to memories, and communicate something nobody asked for.
 
@@ -503,24 +503,64 @@ class CompanionEngine:
         retrieved_memory_text: str,
         reference_images: List[bytes],
         has_canonical_reference: bool,
+        external_images: List[Dict[str, Any]],
     ) -> Tuple[bytes, str]:
+        # The image endpoint receives every visual input in one ordered list.
+        # We therefore tell Image-san exactly which numbered references are HER
+        # self-images and which were posted by OTHER participants.
+        self_reference_count = len(reference_images)
+
         if reference_images:
             if has_canonical_reference:
-                reference_note = (
-                    "Reference image 1 is your canonical self-reference. "
-                    "Any following reference is a recent self-image. "
-                    "Use these to remember your established visual identity and immediately preceding action. "
-                    "They are reference material only: create a new composition from scratch unless the CURRENT MESSAGE explicitly asks to continue the same scene."
+                self_note = (
+                    "The first SELF reference is your canonical self-reference. "
+                    "Any additional SELF reference is a recent image you made. "
+                    "Use SELF references for continuity of your own appearance or recent action, "
+                    "not as a composition you must keep editing."
                 )
             else:
-                reference_note = (
-                    "The reference image is your most recent self-image. "
-                    "Treat it as visual memory of yourself and what you just did, NOT as the base image or composition to keep editing. "
-                    "You are free to replace the room, pose, camera angle, framing, objects, text, activity, and scene. "
-                    "Preserve identity where it has become established, not the previous composition."
+                self_note = (
+                    "Your SELF reference is a recent image you made. "
+                    "Use it as visual memory of yourself and what you recently did, "
+                    "NOT as a scene, pose, camera angle, or composition you must continue."
                 )
         else:
-            reference_note = "No visual reference image is available yet. Respond freely to the CURRENT MESSAGE."
+            self_note = (
+                "No SELF visual reference is available. You are free to establish or change "
+                "your own visual presentation naturally."
+            )
+
+        external_lines: List[str] = []
+        for offset, item in enumerate(external_images, start=1):
+            overall_index = self_reference_count + offset
+            author_kind = "another AI/bot" if item["is_bot"] else "a human"
+            accompanying_text = (item["message_text"] or "").strip()
+            if len(accompanying_text) > 500:
+                accompanying_text = accompanying_text[:500] + "…"
+
+            detail = (
+                f"Reference image {overall_index} is a CONVERSATION IMAGE posted by "
+                f"{item['author_name']} ({author_kind}). It is NOT one of your prior images "
+                f"and must NOT be treated as your identity or visual memory."
+            )
+            if accompanying_text:
+                detail += f' Their accompanying message was: "{accompanying_text}"'
+            external_lines.append(detail)
+
+        external_note = (
+            "\n".join(external_lines)
+            if external_lines
+            else "No external conversation images are being shown on this turn."
+        )
+
+        reference_note = (
+            f"SELF IMAGE GUIDANCE:\n{self_note}\n\n"
+            f"EXTERNAL CONVERSATION IMAGE GUIDANCE:\n{external_note}\n\n"
+            "External conversation images are things other people showed you. Look at them and "
+            "respond to them when relevant. You may refer to, react to, transform, compare, discuss, "
+            "or take inspiration from them, but do not assume the depicted person is you. "
+            "The CURRENT MESSAGE still decides what matters most."
+        )
 
         prompt = f"""
 {COMPANION_CI}
@@ -541,8 +581,8 @@ RETRIEVED MEMORIES (OLDER / RAG)
 --------------------------------
 {retrieved_memory_text}
 
-LAST SELF-IMAGE / VISUAL REFERENCE
-----------------------------------
+VISUAL CONTEXT — SELF VS OTHER PEOPLE'S IMAGES
+------------------------------------------------
 {reference_note}
 
 Create a NEW image that directly responds to the CURRENT MESSAGE.
@@ -558,10 +598,30 @@ The current message outranks the background, memories, and visual reference.
         if IMAGE_QUALITY:
             kwargs["quality"] = IMAGE_QUALITY
 
-        if reference_images:
+        all_visual_inputs: List[Tuple[bytes, str]] = []
+
+        for i, image_bytes in enumerate(reference_images, start=1):
+            kind = "self"
+            all_visual_inputs.append(
+                (image_bytes, f"{kind}_reference_{i}.png")
+            )
+
+        for i, item in enumerate(external_images, start=1):
+            safe_author = "".join(
+                ch if ch.isalnum() or ch in "-_" else "_"
+                for ch in item["author_name"]
+            )[:40] or "participant"
+            all_visual_inputs.append(
+                (
+                    item["bytes"],
+                    f"conversation_image_{i}_from_{safe_author}.png",
+                )
+            )
+
+        if all_visual_inputs:
             files = [
-                named_bytes_io(image_bytes, f"reference_{i}.png")
-                for i, image_bytes in enumerate(reference_images, start=1)
+                named_bytes_io(image_bytes, filename)
+                for image_bytes, filename in all_visual_inputs
             ]
             result = await self.client.images.edit(image=files, **kwargs)
         else:
@@ -638,10 +698,6 @@ engine = CompanionEngine()
 http_session: Optional[aiohttp.ClientSession] = None
 channel_locks: Dict[int, asyncio.Lock] = {}
 
-# Number of consecutive replies in each channel that were triggered by another
-# bot/AI. Any human message in that channel resets the streak.
-ai_trigger_streaks: Dict[int, int] = {}
-
 
 class ImageCompanionBot(discord.Client):
     async def setup_hook(self):
@@ -673,6 +729,7 @@ async def fetch_bytes(url: str) -> bytes:
 
 
 async def build_reference_images(channel_id: str) -> Tuple[List[bytes], bool]:
+    """Image-san's OWN visual memory only."""
     references: List[bytes] = []
     has_canonical = False
 
@@ -690,8 +747,111 @@ async def build_reference_images(channel_id: str) -> Tuple[List[bytes], bool]:
     return references, has_canonical
 
 
-async def directly_targets_image_san(message: discord.Message) -> bool:
-    """True when a message @mentions Image-san or directly replies to her."""
+def attachment_is_image(attachment: discord.Attachment) -> bool:
+    """Discord does not always populate content_type, so also check extension."""
+    content_type = (attachment.content_type or "").lower()
+    if content_type.startswith("image/"):
+        return True
+
+    filename = (attachment.filename or "").lower()
+    return filename.endswith((
+        ".png", ".jpg", ".jpeg", ".webp", ".gif",
+        ".bmp", ".tif", ".tiff"
+    ))
+
+
+async def external_images_from_message(
+    source_message: discord.Message,
+) -> List[Dict[str, Any]]:
+    """Read image attachments from one NON-Image-san Discord message."""
+    if bot.user and source_message.author.id == bot.user.id:
+        return []
+
+    author_name = getattr(
+        source_message.author,
+        "display_name",
+        source_message.author.name,
+    )
+    message_text = (source_message.content or "").strip()
+
+    found: List[Dict[str, Any]] = []
+    for attachment in source_message.attachments:
+        if not attachment_is_image(attachment):
+            continue
+
+        try:
+            image_bytes = await attachment.read()
+        except Exception as exc:
+            print(
+                f"Warning: could not read external image "
+                f"{attachment.filename!r} from {author_name}: {exc}"
+            )
+            continue
+
+        found.append({
+            "bytes": image_bytes,
+            "author_name": author_name,
+            "author_id": str(source_message.author.id),
+            "is_bot": bool(source_message.author.bot),
+            "message_text": message_text,
+            "filename": attachment.filename or "image",
+            "discord_message_id": str(source_message.id),
+        })
+
+    return found
+
+
+async def build_external_conversation_images(
+    message: discord.Message,
+) -> List[Dict[str, Any]]:
+    """
+    Get the newest images posted by humans/other AI in this exact channel/thread.
+
+    The CURRENT message is checked first, then earlier messages. Image-san's own
+    attachments are excluded because her visual memory is supplied separately.
+    Returned order is oldest -> newest so the image model sees natural chronology.
+    """
+    if RECENT_EXTERNAL_IMAGES <= 0:
+        return []
+
+    newest_first: List[Dict[str, Any]] = []
+
+    # Always inspect the active message explicitly. This avoids relying on whether
+    # Discord history has indexed the just-arrived message yet.
+    newest_first.extend(await external_images_from_message(message))
+
+    if len(newest_first) < RECENT_EXTERNAL_IMAGES:
+        try:
+            async for older in message.channel.history(
+                limit=EXTERNAL_IMAGE_SCAN_MESSAGES,
+                before=message,
+            ):
+                found = await external_images_from_message(older)
+
+                # Attachments within a message are already in their message order.
+                # Since messages are being scanned newest -> oldest, prepend nothing
+                # here; we reverse the final selected list below.
+                newest_first.extend(found)
+
+                if len(newest_first) >= RECENT_EXTERNAL_IMAGES:
+                    break
+        except Exception as exc:
+            print(f"Warning: could not scan Discord history for external images: {exc}")
+
+    selected = newest_first[:RECENT_EXTERNAL_IMAGES]
+    return list(reversed(selected))
+
+
+async def should_respond(message: discord.Message) -> bool:
+    if message.author.bot:
+        return False
+
+    if isinstance(message.channel, discord.DMChannel):
+        return RESPOND_IN_DMS
+
+    if RESPOND_TO_ALL:
+        return True
+
     if bot.user and bot.user in message.mentions:
         return True
 
@@ -708,28 +868,6 @@ async def directly_targets_image_san(message: discord.Message) -> bool:
             pass
 
     return False
-
-
-async def should_respond(message: discord.Message) -> bool:
-    # Never answer our own Discord messages.
-    if bot.user and message.author.id == bot.user.id:
-        return False
-
-    directly_targeted = await directly_targets_image_san(message)
-
-    # Other bots / AI are allowed to talk to Image-san ONLY when they directly
-    # @mention her or reply to one of her messages. RESPOND_TO_ALL never makes
-    # her answer arbitrary bot chatter.
-    if message.author.bot:
-        return ALLOW_AI_TAGS and directly_targeted
-
-    if isinstance(message.channel, discord.DMChannel):
-        return RESPOND_IN_DMS
-
-    if RESPOND_TO_ALL:
-        return True
-
-    return directly_targeted
 
 
 async def handle_memories_command(message: discord.Message) -> bool:
@@ -862,39 +1000,14 @@ async def on_message(message: discord.Message):
 
     await storage.save_message(message)
 
-    channel_key = message.channel.id
-
-    # A human message breaks any AI-to-AI chain, even if the human did not
-    # directly summon Image-san. This lets normal conversation naturally reset
-    # the loop guard.
-    if not message.author.bot:
-        ai_trigger_streaks[channel_key] = 0
-
     if not await should_respond(message):
         return
 
-    lock = channel_locks.setdefault(channel_key, asyncio.Lock())
+    lock = channel_locks.setdefault(message.channel.id, asyncio.Lock())
 
     # Ignore additional triggers while an image for this channel is already generating.
-    # Do this before counting an AI turn so a tag that arrives mid-generation does not
-    # consume one of the two allowed AI replies without actually receiving a response.
     if lock.locked():
         return
-
-    # Other AI/bots can directly tag or reply to Image-san, but she will only
-    # answer AI_TAG_REPLY_LIMIT consecutive AI-triggered turns. After that she
-    # stays silent until a human speaks in the channel.
-    if message.author.bot:
-        current_streak = ai_trigger_streaks.get(channel_key, 0)
-
-        if AI_TAG_REPLY_LIMIT == 0 or current_streak >= AI_TAG_REPLY_LIMIT:
-            print(
-                f"Ignoring AI trigger in channel {channel_key}: "
-                f"AI reply limit ({AI_TAG_REPLY_LIMIT}) reached."
-            )
-            return
-
-        ai_trigger_streaks[channel_key] = current_streak + 1
 
     async with lock:
         try:
@@ -953,6 +1066,20 @@ async def handle_turn(message: discord.Message):
 
     reference_images, has_canonical = await build_reference_images(channel_id)
 
+    # Separate visual channel:
+    # - reference_images = Image-san's OWN prior visual memory
+    # - external_images = latest images posted by humans/other AI in this channel/thread
+    external_images = await build_external_conversation_images(message)
+
+    if external_images:
+        print(
+            "External conversation images this turn: "
+            + ", ".join(
+                f"{item['author_name']}:{item['filename']}"
+                for item in external_images
+            )
+        )
+
     async with message.channel.typing():
         image_bytes, prompt_used = await engine.generate_image(
             current_message_text=current_message_text,
@@ -961,6 +1088,7 @@ async def handle_turn(message: discord.Message):
             retrieved_memory_text=retrieved_memory_text,
             reference_images=reference_images,
             has_canonical_reference=has_canonical,
+            external_images=external_images,
         )
 
     # The public companion response is the image only.
