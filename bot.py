@@ -1141,11 +1141,26 @@ async def handle_turn(message: discord.Message):
             external_images=external_images,
         )
 
-    # The public companion response is the image only.
+    # Human-triggered replies stay image-only and do not ping.
+    #
+    # AI/bot-triggered replies explicitly @mention the AI that summoned Image-san.
+    # This is intentional: many companion bots only wake up when they see a direct
+    # mention and will not treat a bare Discord reply-reference as a trigger.
+    if message.author.bot:
+        reply_content = f"<@{message.author.id}>"
+        reply_allowed_mentions = discord.AllowedMentions(
+            users=[message.author],
+            replied_user=False,
+        )
+    else:
+        reply_content = None
+        reply_allowed_mentions = discord.AllowedMentions.none()
+
     sent = await message.reply(
+        content=reply_content,
         file=discord.File(io.BytesIO(image_bytes), filename="reply.png"),
         mention_author=False,
-        allowed_mentions=discord.AllowedMentions.none(),
+        allowed_mentions=reply_allowed_mentions,
     )
 
     attachment_url = sent.attachments[0].url if sent.attachments else ""
