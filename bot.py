@@ -3,11 +3,13 @@ import io
 import json
 import base64
 import asyncio
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 import aiohttp
 import asyncpg
 import discord
+from PIL import Image, UnidentifiedImageError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -51,6 +53,7 @@ EXTERNAL_IMAGE_SCAN_MESSAGES = max(
 IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024").strip() or None
 IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "medium").strip() or None
 CANONICAL_REFERENCE_URL = os.getenv("CANONICAL_REFERENCE_URL", "").strip() or None
+CANONICAL_REFERENCE_PATH = os.getenv("CANONICAL_REFERENCE_PATH", "").strip() or None
 COMPANION_NAME = os.getenv("COMPANION_NAME", "Image-san").strip()
 
 if not DISCORD_BOT_TOKEN:
@@ -142,6 +145,29 @@ def named_bytes_io(data: bytes, name: str) -> io.BytesIO:
     bio.name = name
     bio.seek(0)
     return bio
+
+
+def normalize_image_for_api(data: bytes, source_name: str = "image") -> bytes:
+    """Decode an image and re-encode it as a genuine PNG for the image API."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            try:
+                image.seek(0)
+            except EOFError:
+                pass
+
+            if "A" in image.getbands() or image.mode in ("RGBA", "LA"):
+                normalized = image.convert("RGBA")
+            else:
+                normalized = image.convert("RGB")
+
+            output = io.BytesIO()
+            normalized.save(output, format="PNG")
+            return output.getvalue()
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError(
+            f"Could not decode {source_name!r} as an image: {exc}"
+        ) from exc
 
 
 def truncate(text: str, max_chars: int = 24000) -> str:
@@ -240,6 +266,19 @@ class Storage:
             sql = f.read()
         async with self.pool.acquire() as conn:
             await conn.execute(sql)
+
+    async def get_db_debug(self) -> Dict[str, Any]:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    current_database() AS database_name,
+                    current_schema() AS schema_name,
+                    current_setting('search_path') AS search_path,
+                    (SELECT COUNT(*) FROM memories) AS memory_count
+                """
+            )
+            return dict(row)
 
     async def save_message(self, message: discord.Message):
         async with self.pool.acquire() as conn:
@@ -743,12 +782,28 @@ async def build_reference_images(channel_id: str) -> Tuple[List[bytes], bool]:
     references: List[bytes] = []
     has_canonical = False
 
-    if CANONICAL_REFERENCE_URL:
+    if CANONICAL_REFERENCE_PATH:
         try:
-            references.append(await fetch_bytes(CANONICAL_REFERENCE_URL))
+            reference_path = Path(CANONICAL_REFERENCE_PATH)
+            raw_reference = reference_path.read_bytes()
+            references.append(
+                normalize_image_for_api(raw_reference, reference_path.name)
+            )
             has_canonical = True
+            print(f"Loaded local canonical reference: {reference_path}")
         except Exception as exc:
-            print(f"Warning: canonical reference could not be loaded: {exc}")
+            print(f"Warning: local canonical reference could not be loaded: {exc}")
+
+    if not has_canonical and CANONICAL_REFERENCE_URL:
+        try:
+            raw_reference = await fetch_bytes(CANONICAL_REFERENCE_URL)
+            references.append(
+                normalize_image_for_api(raw_reference, CANONICAL_REFERENCE_URL)
+            )
+            has_canonical = True
+            print("Loaded canonical reference from URL.")
+        except Exception as exc:
+            print(f"Warning: canonical reference URL could not be loaded: {exc}")
 
     references.extend(
         await storage.get_recent_image_bytes(channel_id, RECENT_IMAGE_TURNS)
@@ -790,10 +845,14 @@ async def external_images_from_message(
             continue
 
         try:
-            image_bytes = await attachment.read()
+            raw_image_bytes = await attachment.read()
+            image_bytes = normalize_image_for_api(
+                raw_image_bytes,
+                attachment.filename or "discord image",
+            )
         except Exception as exc:
             print(
-                f"Warning: could not read external image "
+                f"Warning: skipping external image "
                 f"{attachment.filename!r} from {author_name}: {exc}"
             )
             continue
@@ -896,6 +955,28 @@ async def should_respond(message: discord.Message) -> bool:
         return True
 
     return directly_targeted
+
+
+async def handle_dbwhere_command(message: discord.Message) -> bool:
+    content = (message.content or "").strip().lower()
+    if content != "!dbwhere":
+        return False
+
+    if not is_command_owner(message):
+        return True
+
+    info = await storage.get_db_debug()
+    await message.reply(
+        (
+            f"**{COMPANION_NAME} DB**\n"
+            f"database: `{info['database_name']}`\n"
+            f"schema: `{info['schema_name']}`\n"
+            f"search_path: `{info['search_path']}`\n"
+            f"memories visible here: `{info['memory_count']}`"
+        ),
+        mention_author=False,
+    )
+    return True
 
 
 async def handle_memories_command(message: discord.Message) -> bool:
@@ -1020,7 +1101,9 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Debug/admin command: do not add the command itself to companion context.
+    # Debug/admin commands: do not add the command itself to companion context.
+    if await handle_dbwhere_command(message):
+        return
     if await handle_memories_command(message):
         return
     if await handle_memory_context_command(message):
