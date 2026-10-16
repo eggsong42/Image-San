@@ -3,7 +3,10 @@ import io
 import json
 import base64
 import asyncio
+import hashlib
 from pathlib import Path
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any, Tuple
 
 import aiohttp
@@ -55,6 +58,22 @@ IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "medium").strip() or None
 CANONICAL_REFERENCE_URL = os.getenv("CANONICAL_REFERENCE_URL", "").strip() or None
 CANONICAL_REFERENCE_PATH = os.getenv("CANONICAL_REFERENCE_PATH", "").strip() or None
 COMPANION_NAME = os.getenv("COMPANION_NAME", "Image-san").strip()
+
+# Optional proactive posting. Give the bot a comma-separated list of channel IDs.
+# One proactive image is allowed per configured channel per day.
+PROACTIVE_ENABLED = os.getenv("PROACTIVE_ENABLED", "false").lower() == "true"
+PROACTIVE_CHANNEL_IDS = [
+    item.strip()
+    for item in os.getenv("PROACTIVE_CHANNEL_IDS", "").split(",")
+    if item.strip()
+]
+PROACTIVE_HOURS = [
+    int(item.strip())
+    for item in os.getenv("PROACTIVE_HOURS", "11,16,21").split(",")
+    if item.strip()
+]
+PROACTIVE_TIMEZONE = os.getenv("PROACTIVE_TIMEZONE", "Europe/London").strip() or "Europe/London"
+PROACTIVE_CHECK_SECONDS = max(60, int(os.getenv("PROACTIVE_CHECK_SECONDS", "180")))
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN")
@@ -266,6 +285,43 @@ class Storage:
             sql = f.read()
         async with self.pool.acquire() as conn:
             await conn.execute(sql)
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proactive_posts (
+                    local_date DATE NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (local_date, channel_id)
+                )
+                """
+            )
+
+    async def claim_proactive_slot(self, local_date, channel_id: str) -> bool:
+        """Atomically reserve this channel's one proactive post for the local day."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO proactive_posts(local_date, channel_id)
+                VALUES($1, $2)
+                ON CONFLICT (local_date, channel_id) DO NOTHING
+                RETURNING channel_id
+                """,
+                local_date,
+                channel_id,
+            )
+            return row is not None
+
+    async def release_proactive_slot(self, local_date, channel_id: str):
+        """Release a failed proactive attempt so it may retry later in the same hour."""
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                DELETE FROM proactive_posts
+                WHERE local_date = $1 AND channel_id = $2
+                """,
+                local_date,
+                channel_id,
+            )
 
     async def get_db_debug(self) -> Dict[str, Any]:
         async with self.pool.acquire() as conn:
@@ -742,6 +798,7 @@ storage = Storage(DATABASE_URL)
 engine = CompanionEngine()
 http_session: Optional[aiohttp.ClientSession] = None
 channel_locks: Dict[int, asyncio.Lock] = {}
+proactive_loop_task: Optional[asyncio.Task] = None
 
 # Consecutive replies in each channel that were triggered by another bot/AI.
 # Any human message in that channel resets this to zero.
@@ -900,6 +957,25 @@ async def build_external_conversation_images(
                     break
         except Exception as exc:
             print(f"Warning: could not scan Discord history for external images: {exc}")
+
+    selected = newest_first[:RECENT_EXTERNAL_IMAGES]
+    return list(reversed(selected))
+
+
+async def build_proactive_external_images(channel) -> List[Dict[str, Any]]:
+    """Newest external images in a channel/thread for a proactive turn."""
+    if RECENT_EXTERNAL_IMAGES <= 0:
+        return []
+
+    newest_first: List[Dict[str, Any]] = []
+
+    try:
+        async for older in channel.history(limit=EXTERNAL_IMAGE_SCAN_MESSAGES):
+            newest_first.extend(await external_images_from_message(older))
+            if len(newest_first) >= RECENT_EXTERNAL_IMAGES:
+                break
+    except Exception as exc:
+        print(f"Warning: proactive external-image scan failed: {exc}")
 
     selected = newest_first[:RECENT_EXTERNAL_IMAGES]
     return list(reversed(selected))
@@ -1092,9 +1168,216 @@ async def build_memory_query(
     return " ".join(chunks)[:4000].strip()
 
 
+def proactive_target_minute(local_date, channel_id: str) -> int:
+    """
+    Stable pseudo-random minute between :05 and :54.
+    Changes each day and differs between channels, but survives restarts.
+    """
+    seed = f"{COMPANION_NAME}|{local_date.isoformat()}|{channel_id}".encode("utf-8")
+    digest = hashlib.sha256(seed).digest()
+    return 5 + (int.from_bytes(digest[:2], "big") % 50)
+
+
+async def send_proactive_turn(channel):
+    channel_id = str(channel.id)
+
+    # Same text/memory machinery as a normal turn, except there is deliberately
+    # no fake Discord user message.
+    own_id = str(bot.user.id) if bot.user else None
+    recent_rows = await storage.get_recent_messages(
+        channel_id,
+        RECENT_TEXT_MESSAGES,
+        exclude_author_id=own_id,
+    )
+    recent_background_text = format_recent_messages(recent_rows)
+
+    recent_memory_rows = await storage.get_recent_memories(
+        channel_id,
+        RECENT_MEMORIES,
+    )
+    recent_memory_ids = [row["id"] for row in recent_memory_rows]
+    recent_memory_text = format_memories(list(reversed(recent_memory_rows)))
+
+    proactive_current = (
+        f"{COMPANION_NAME}: You have chosen to make an unsolicited post in this channel. "
+        "Nobody has prompted you. Look at the recent conversation, your memories, and visual context, "
+        "then decide what YOU want to communicate right now. It may be a reaction, question, callback, "
+        "joke, scene, observation, invitation, artwork, tangent, or something entirely your own. "
+        "Do not announce that this is scheduled, automated, or proactive. Do not merely summarize the chat."
+    )
+
+    query_text = await build_memory_query(proactive_current, recent_rows)
+    retrieved_memory_rows = await storage.get_relevant_memories(
+        memory_scope_for_channel(channel),
+        query_text,
+        MAX_RETRIEVED_MEMORIES,
+        exclude_ids=recent_memory_ids,
+    )
+    retrieved_memory_text = format_memories(
+        retrieved_memory_rows,
+        include_channel=True,
+    )
+
+    reference_images, has_canonical = await build_reference_images(channel_id)
+    external_images = await build_proactive_external_images(channel)
+
+    async with channel.typing():
+        image_bytes, prompt_used = await engine.generate_image(
+            current_message_text=proactive_current,
+            recent_background_text=recent_background_text,
+            recent_memory_text=recent_memory_text,
+            retrieved_memory_text=retrieved_memory_text,
+            reference_images=reference_images,
+            has_canonical_reference=has_canonical,
+            external_images=external_images,
+        )
+
+    sent = await channel.send(
+        file=discord.File(io.BytesIO(image_bytes), filename="reply.png"),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+    attachment_url = sent.attachments[0].url if sent.attachments else ""
+    await storage.save_bot_placeholder(sent)
+
+    try:
+        helper_context = (
+            "PROACTIVE SELF-INITIATED TURN:\n"
+            + proactive_current
+            + "\n\nRECENT CHANNEL CONTEXT:\n"
+            + recent_background_text
+        )
+        summary = await engine.summarize_image_to_memory(
+            image_bytes=image_bytes,
+            recent_messages_text=helper_context,
+        )
+    except Exception as exc:
+        print(f"Proactive memory helper failed: {repr(exc)}")
+        summary = {
+            "memory": "I chose to post an image in the channel on my own.",
+            "significance": 1,
+        }
+
+    await storage.save_output_and_memory(
+        scope_id=memory_scope_for_channel(channel),
+        channel_id=channel_id,
+        channel_name=getattr(channel, "name", channel_id),
+        discord_message_id=str(sent.id),
+        attachment_url=attachment_url,
+        prompt_used=prompt_used,
+        image_bytes=image_bytes,
+        memory=summary["memory"],
+        significance=summary["significance"],
+        keep_recent_images=RECENT_IMAGE_TURNS,
+    )
+
+    print(
+        f"Proactive post sent in channel {channel_id} "
+        f"(significance {summary['significance']})."
+    )
+
+
+def memory_scope_for_channel(channel) -> str:
+    guild = getattr(channel, "guild", None)
+    if guild is not None:
+        return f"guild:{guild.id}"
+    return f"dm:{channel.id}"
+
+
+async def proactive_loop():
+    await bot.wait_until_ready()
+
+    try:
+        timezone = ZoneInfo(PROACTIVE_TIMEZONE)
+    except Exception:
+        print(
+            f"Warning: invalid PROACTIVE_TIMEZONE={PROACTIVE_TIMEZONE!r}; "
+            "falling back to UTC."
+        )
+        timezone = ZoneInfo("UTC")
+
+    if not PROACTIVE_HOURS:
+        print("Proactive posting disabled: PROACTIVE_HOURS is empty.")
+        return
+
+    print(
+        f"Proactive loop started for {len(PROACTIVE_CHANNEL_IDS)} channel(s) "
+        f"in timezone {timezone.key}."
+    )
+
+    while not bot.is_closed():
+        try:
+            now = datetime.now(timezone)
+            local_date = now.date()
+
+            for index, channel_id_text in enumerate(PROACTIVE_CHANNEL_IDS):
+                try:
+                    channel_id = int(channel_id_text)
+                except ValueError:
+                    print(f"Warning: invalid proactive channel ID: {channel_id_text!r}")
+                    continue
+
+                due_hour = PROACTIVE_HOURS[index % len(PROACTIVE_HOURS)]
+                due_minute = proactive_target_minute(local_date, channel_id_text)
+
+                # Only post during this channel's assigned local hour. No catch-up
+                # storm later in the day if Railway happened to be offline.
+                if now.hour != due_hour or now.minute < due_minute:
+                    continue
+
+                channel = bot.get_channel(channel_id)
+                if channel is None:
+                    try:
+                        channel = await bot.fetch_channel(channel_id)
+                    except Exception as exc:
+                        print(
+                            f"Warning: proactive channel {channel_id} unavailable: {exc}"
+                        )
+                        continue
+
+                claimed = await storage.claim_proactive_slot(
+                    local_date,
+                    channel_id_text,
+                )
+                if not claimed:
+                    continue
+
+                lock = channel_locks.setdefault(channel_id, asyncio.Lock())
+                if lock.locked():
+                    # Normal conversation has priority. Let proactive retry later
+                    # in the same hour.
+                    await storage.release_proactive_slot(
+                        local_date,
+                        channel_id_text,
+                    )
+                    continue
+
+                try:
+                    async with lock:
+                        await send_proactive_turn(channel)
+                except Exception as exc:
+                    print(
+                        f"Proactive turn failed in channel {channel_id}: {repr(exc)}"
+                    )
+                    await storage.release_proactive_slot(
+                        local_date,
+                        channel_id_text,
+                    )
+
+        except Exception as exc:
+            print(f"Proactive loop error: {repr(exc)}")
+
+        await asyncio.sleep(PROACTIVE_CHECK_SECONDS)
+
+
 @bot.event
 async def on_ready():
+    global proactive_loop_task
     print(f"Logged in as {bot.user} ({bot.user.id if bot.user else 'unknown'})")
+    if PROACTIVE_ENABLED and PROACTIVE_CHANNEL_IDS:
+        if proactive_loop_task is None or proactive_loop_task.done():
+            proactive_loop_task = asyncio.create_task(proactive_loop())
+
     if not OWNER_DISCORD_ID:
         print("Warning: OWNER_DISCORD_ID is not set; admin memory commands are locked for everyone.")
 
