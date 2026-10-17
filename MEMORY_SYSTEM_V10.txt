@@ -1,0 +1,118 @@
+IMAGE COMPANION MEMORY SYSTEM v10
+
+WHAT CHANGED
+
+1. PERSON CARDS
+- Loads people_cards.txt on startup.
+- Same file can be used by Image-san and Jett.
+- A person's full card is only inserted when relevant:
+  * they are the current speaker
+  * they are directly @mentioned
+  * their name/alias is explicitly used
+  * they supplied one of the current external conversation images
+- Raw Discord tags like <@123456...> are translated to readable names in model context.
+- The entire roster is NOT sent every turn.
+
+To add a person:
+Append another block to people_cards.txt in this format:
+
+Name: Example
+Discord ID: 123456789
+Aliases: Ex, Example
+
+Appearance:
+Short factual description.
+
+Relationship:
+How they relate to San/Jett/others.
+
+Notes:
+Useful stable facts.
+
+---
+
+Commit the file to GitHub and redeploy. The bot UPSERTS the cards automatically.
+No manual SQL is required.
+
+Owner commands:
+!people
+!person NAME
+!personreload
+
+2. EPISODIC MEMORY
+The visual-memory helper now sees a small amount of existing memory before deciding
+whether to save a new episode.
+
+It can return save=false for pure repetition, so "I am a red panda" should no
+longer be saved again merely because San appears as a red panda in another image.
+
+Owner commands:
+!memories 20
+!memsearch words
+!memedit ID replacement text
+!memarchive ID
+!memrestore ID
+!memdelete ID
+
+Archive = stays in Neon but no longer enters normal cognition/RAG.
+Delete = hard deletion.
+
+3. DURABLE / SEMANTIC MEMORY
+Consolidation creates a compact layer of stable facts such as:
+- established appearance
+- preferences
+- recurring relationships
+- ongoing projects
+- repeated motifs/patterns
+
+Durable memory is always supplied in a small separate prompt section.
+
+Owner commands:
+!durable
+!durableadd category | text
+!durableedit ID replacement text
+!durabledelete ID
+
+Anything manually added or edited is PINNED. Automatic consolidation will not
+rewrite pinned durable memories.
+
+4. CONSOLIDATION
+On the first run of this version, each existing memory scope gets a one-time pass
+over its active episodic memories.
+
+Redundant episodes are ARCHIVED, not deleted.
+Useful repeated information is compressed into durable memory.
+Distinctive events should remain episodic.
+
+After that, consolidation runs after roughly 20 newly-saved episodes.
+
+Optional Railway variables:
+PEOPLE_CARDS_PATH=people_cards.txt
+AUTO_CONSOLIDATE=true
+CONSOLIDATE_EVERY=20
+CONSOLIDATION_BATCH_SIZE=24
+DURABLE_MEMORY_LIMIT=12
+
+Manual:
+!consolidate
+
+5. MEMORY CONTEXT
+!memorycontext now shows:
+- durable memories
+- recent active episodes
+- RAG-retrieved active episodes
+
+Archived episodes remain inspectable/searchable through admin commands but are
+excluded from normal prompt context.
+
+IMPORTANT CARD DATA WARNING
+The supplied cards currently give Felix and Tithe the SAME Discord ID:
+1534352936593916067
+
+The system deliberately treats a duplicated Discord ID as ambiguous rather than
+guessing which person it means. Fix either card's ID in people_cards.txt when you
+know the correct one.
+
+Also note: the supplied Image-san card says she cannot see other people's images.
+The current bot CAN see recent external conversation images, so you may want to
+update that sentence in people_cards.txt later.

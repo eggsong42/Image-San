@@ -1,0 +1,19 @@
+Proactive posting
+
+Railway variables:
+
+PROACTIVE_ENABLED=true
+PROACTIVE_CHANNEL_IDS=111111111111111111,222222222222222222,333333333333333333
+PROACTIVE_HOURS=11,16,21
+PROACTIVE_TIMEZONE=Europe/London
+PROACTIVE_CHECK_SECONDS=180
+
+Behaviour:
+- One proactive image per configured channel per local day.
+- Channel 1 uses hour 1, channel 2 uses hour 2, etc.
+- The exact minute is pseudo-random between :05 and :54 and changes daily.
+- No catch-up flood if the bot was offline during a slot.
+- Neon records the completed channel/day slot so restarts do not duplicate posts.
+- Normal conversation takes priority if the bot is already generating.
+- Proactive posts do not ping anyone.
+- The bot uses its normal recent text, memories, RAG, self-reference and external images.

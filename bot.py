@@ -4,6 +4,7 @@ import json
 import base64
 import asyncio
 import hashlib
+from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -15,6 +16,11 @@ import discord
 from PIL import Image, UnidentifiedImageError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
+from memory_system import (
+    MemoryManager,
+    MEMORY_ARCHIVIST_SYSTEM,
+    MEMORY_SAVE_JSON_SCHEMA,
+)
 
 load_dotenv()
 
@@ -74,6 +80,13 @@ PROACTIVE_HOURS = [
 ]
 PROACTIVE_TIMEZONE = os.getenv("PROACTIVE_TIMEZONE", "Europe/London").strip() or "Europe/London"
 PROACTIVE_CHECK_SECONDS = max(60, int(os.getenv("PROACTIVE_CHECK_SECONDS", "180")))
+
+# Memory architecture / person cards
+PEOPLE_CARDS_PATH = os.getenv("PEOPLE_CARDS_PATH", "people_cards.txt").strip() or "people_cards.txt"
+AUTO_CONSOLIDATE = os.getenv("AUTO_CONSOLIDATE", "true").lower() == "true"
+CONSOLIDATE_EVERY = max(5, int(os.getenv("CONSOLIDATE_EVERY", "20")))
+CONSOLIDATION_BATCH_SIZE = max(8, int(os.getenv("CONSOLIDATION_BATCH_SIZE", "24")))
+DURABLE_MEMORY_LIMIT = max(4, int(os.getenv("DURABLE_MEMORY_LIMIT", "12")))
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN")
@@ -155,6 +168,11 @@ MEMORY_JSON_SCHEMA = {
 }
 
 
+# Memory v10: the helper may decline to save pure duplicates.
+MEMORY_COMPRESSOR_SYSTEM = MEMORY_ARCHIVIST_SYSTEM
+MEMORY_JSON_SCHEMA = MEMORY_SAVE_JSON_SCHEMA
+
+
 # ============================================================
 # Utilities
 # ============================================================
@@ -201,18 +219,26 @@ def format_recent_messages(rows: List[asyncpg.Record]) -> str:
 
     lines = []
     for row in rows:
-        # Image-san's own messages are excluded before this formatter is called.
-        # Other Discord bots/AI should keep their real names rather than being
-        # mistaken for Image-san merely because Discord marks them as bots.
-        speaker = row["author_name"] or "Unknown"
-        content = (row["content"] or "").strip() or "[no text]"
+        fallback = row["author_name"] or "Unknown"
+        speaker = memory_manager.canonical_name(str(row["author_id"]), fallback)
+        content = memory_manager.resolve_mentions(
+            (row["content"] or "").strip() or "[no text]"
+        )
         lines.append(f"{speaker}: {content}")
     return "\n".join(lines)
 
 
 def format_current_message(message: discord.Message) -> str:
-    speaker = getattr(message.author, "display_name", message.author.name)
-    content = (message.content or "").strip() or "[no text]"
+    fallback = getattr(message.author, "display_name", message.author.name)
+    speaker = memory_manager.canonical_name(str(message.author.id), fallback)
+    live_names = {
+        str(person.id): getattr(person, "display_name", person.name)
+        for person in message.mentions
+    }
+    content = memory_manager.resolve_mentions(
+        (message.content or "").strip() or "[no text]",
+        live_names=live_names,
+    )
     return f"{speaker}: {content}"
 
 
@@ -279,6 +305,13 @@ class Storage:
     async def close(self):
         if self.pool:
             await self.pool.close()
+
+    @asynccontextmanager
+    async def connection(self):
+        """Uniform transaction context used by the memory subsystem."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
 
     async def init_schema(self):
         with open("schema.sql", "r", encoding="utf-8") as f:
@@ -426,68 +459,71 @@ class Storage:
         attachment_url: str,
         prompt_used: str,
         image_bytes: bytes,
-        memory: str,
+        memory: Optional[str],
         significance: int,
         keep_recent_images: int,
-    ):
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                output_id = await conn.fetchval(
-                    """
-                    INSERT INTO outputs(
-                        channel_id, discord_message_id, attachment_url, prompt_used
-                    )
-                    VALUES($1, $2, $3, $4)
-                    RETURNING id
-                    """,
-                    channel_id,
-                    discord_message_id,
-                    attachment_url,
-                    prompt_used,
+    ) -> Optional[int]:
+        async with self.connection() as conn:
+            output_id = await conn.fetchval(
+                """
+                INSERT INTO outputs(
+                    channel_id, discord_message_id, attachment_url, prompt_used
                 )
+                VALUES($1, $2, $3, $4)
+                RETURNING id
+                """,
+                channel_id,
+                discord_message_id,
+                attachment_url,
+                prompt_used,
+            )
 
-                await conn.execute(
+            memory_id = None
+            if memory and memory.strip():
+                memory_id = await conn.fetchval(
                     """
                     INSERT INTO memories(
-                        scope_id, channel_id, channel_name, content, significance, source_output_id
+                        scope_id, channel_id, channel_name, content,
+                        significance, source_output_id, kind, status
                     )
-                    VALUES($1, $2, $3, $4, $5, $6)
+                    VALUES($1, $2, $3, $4, $5, $6, 'episode', 'active')
+                    RETURNING id
                     """,
                     scope_id,
                     channel_id,
                     channel_name,
-                    memory,
+                    memory.strip(),
                     significance,
                     output_id,
                 )
 
-                await conn.execute(
-                    """
-                    INSERT INTO recent_images(channel_id, discord_message_id, image_bytes)
-                    VALUES($1, $2, $3)
-                    ON CONFLICT (discord_message_id) DO NOTHING
-                    """,
-                    channel_id,
-                    discord_message_id,
-                    image_bytes,
-                )
+            await conn.execute(
+                """
+                INSERT INTO recent_images(channel_id, discord_message_id, image_bytes)
+                VALUES($1, $2, $3)
+                ON CONFLICT (discord_message_id) DO NOTHING
+                """,
+                channel_id,
+                discord_message_id,
+                image_bytes,
+            )
 
-                # Keep only the newest N image blobs as visual working memory.
-                await conn.execute(
-                    """
-                    DELETE FROM recent_images
-                    WHERE channel_id = $1
-                      AND id NOT IN (
-                          SELECT id
-                          FROM recent_images
-                          WHERE channel_id = $1
-                          ORDER BY created_at DESC
-                          LIMIT $2
-                      )
-                    """,
-                    channel_id,
-                    keep_recent_images,
-                )
+            await conn.execute(
+                """
+                DELETE FROM recent_images
+                WHERE channel_id = $1
+                  AND id NOT IN (
+                      SELECT id
+                      FROM recent_images
+                      WHERE channel_id = $1
+                      ORDER BY created_at DESC
+                      LIMIT $2
+                  )
+                """,
+                channel_id,
+                keep_recent_images,
+            )
+            return memory_id
 
     async def get_recent_image_bytes(self, channel_id: str, limit: int) -> List[bytes]:
         async with self.pool.acquire() as conn:
@@ -514,6 +550,8 @@ class Storage:
                 SELECT id, channel_id, channel_name, content, significance, created_at
                 FROM memories
                 WHERE channel_id = $1
+                  AND status = 'active'
+                  AND kind = 'episode'
                 ORDER BY created_at DESC
                 LIMIT $2
                 """,
@@ -553,6 +591,8 @@ class Storage:
                     SELECT id, channel_id, channel_name, content, significance, created_at
                     FROM memories
                     WHERE scope_id = $1
+                      AND status = 'active'
+                      AND kind = 'episode'
                       AND NOT (id = ANY($4::bigint[]))
                     ORDER BY
                         CASE
@@ -576,6 +616,8 @@ class Storage:
                     SELECT id, channel_id, channel_name, content, significance, created_at
                     FROM memories
                     WHERE scope_id = $1
+                      AND status = 'active'
+                      AND kind = 'episode'
                       AND NOT (id = ANY($3::bigint[]))
                     ORDER BY significance DESC, created_at DESC
                     LIMIT $2
@@ -599,7 +641,9 @@ class CompanionEngine:
     async def generate_image(
         self,
         current_message_text: str,
+        people_context_text: str,
         recent_background_text: str,
+        durable_memory_text: str,
         recent_memory_text: str,
         retrieved_memory_text: str,
         reference_images: List[bytes],
@@ -670,12 +714,20 @@ CURRENT MESSAGE — RESPOND TO THIS
 ---------------------------------
 {current_message_text}
 
+PEOPLE RELEVANT TO THIS TURN
+----------------------------
+{people_context_text}
+
 IMMEDIATE BACKGROUND — CONTEXT ONLY
 -----------------------------------
 {recent_background_text}
 
-RECENT MEMORIES
----------------
+DURABLE MEMORY — STABLE / CONSOLIDATED
+---------------------------------------
+{durable_memory_text}
+
+RECENT EPISODIC MEMORIES
+------------------------
 {recent_memory_text}
 
 RETRIEVED MEMORIES (OLDER / RAG)
@@ -737,6 +789,7 @@ The current message outranks the background, memories, and visual reference.
         self,
         image_bytes: bytes,
         recent_messages_text: str,
+        existing_memory_context: str,
     ) -> Dict[str, Any]:
         data_url = (
             "data:image/png;base64,"
@@ -763,9 +816,10 @@ The current message outranks the background, memories, and visual reference.
                         {
                             "type": "input_text",
                             "text": (
-                                "Immediate conversation context follows. Use it only "
-                                "to identify factual continuity and obvious interaction facts:\n\n"
+                                "IMMEDIATE CONVERSATION CONTEXT:\n"
                                 + recent_messages_text
+                                + "\n\nEXISTING MEMORY CONTEXT — use this to avoid duplicates:\n"
+                                + existing_memory_context
                             ),
                         },
                         {
@@ -778,13 +832,19 @@ The current message outranks the background, memories, and visual reference.
         )
 
         parsed = json.loads(response.output_text)
+        save = bool(parsed.get("save", True))
         memory = (parsed.get("memory") or "").strip()
         significance = safe_int(str(parsed.get("significance", 1)), 1, 1, 3)
 
-        if not memory:
-            memory = "I replied with an image."
+        if not save:
+            memory = ""
+            significance = 1
+        elif not memory:
+            save = False
+            significance = 1
 
         return {
+            "save": save,
             "memory": memory,
             "significance": significance,
         }
@@ -796,6 +856,16 @@ The current message outranks the background, memories, and visual reference.
 
 storage = Storage(DATABASE_URL)
 engine = CompanionEngine()
+memory_manager = MemoryManager(
+    storage=storage,
+    client=engine.client,
+    helper_model=OPENAI_HELPER_MODEL,
+    companion_name=COMPANION_NAME,
+    people_cards_path=PEOPLE_CARDS_PATH,
+    consolidate_every=CONSOLIDATE_EVERY,
+    consolidation_batch_size=CONSOLIDATION_BATCH_SIZE,
+    durable_limit=DURABLE_MEMORY_LIMIT,
+)
 http_session: Optional[aiohttp.ClientSession] = None
 channel_locks: Dict[int, asyncio.Lock] = {}
 proactive_loop_task: Optional[asyncio.Task] = None
@@ -803,6 +873,8 @@ proactive_loop_task: Optional[asyncio.Task] = None
 # Consecutive replies in each channel that were triggered by another bot/AI.
 # Any human message in that channel resets this to zero.
 ai_trigger_streaks: Dict[int, int] = {}
+consolidation_locks: Dict[str, asyncio.Lock] = {}
+initial_consolidation_task: Optional[asyncio.Task] = None
 
 
 class ImageCompanionBot(discord.Client):
@@ -810,8 +882,12 @@ class ImageCompanionBot(discord.Client):
         global http_session
         await storage.connect()
         await storage.init_schema()
+        conflicts = await memory_manager.initialize()
+        if conflicts:
+            print(f"Warning: duplicate Discord IDs in people cards: {conflicts}")
+        print(f"Loaded {len(memory_manager.people_cache)} people cards.")
         http_session = aiohttp.ClientSession()
-        print("Database and HTTP session ready.")
+        print("Database, people cards and HTTP session ready.")
 
     async def close(self):
         global http_session
@@ -1055,6 +1131,164 @@ async def handle_dbwhere_command(message: discord.Message) -> bool:
     return True
 
 
+async def send_command_chunks(message: discord.Message, text: str):
+    while text:
+        chunk = text[:1900]
+        if len(text) > 1900:
+            split_at = chunk.rfind("\n\n")
+            if split_at > 500:
+                chunk = chunk[:split_at]
+        await message.reply(chunk, mention_author=False)
+        text = text[len(chunk):].lstrip()
+
+
+async def handle_memory_admin_command(message: discord.Message) -> bool:
+    content = (message.content or "").strip()
+    if not content.startswith("!"):
+        return False
+
+    command, _, rest = content.partition(" ")
+    command = command.lower()
+    managed = {
+        "!memories", "!memsearch", "!memedit", "!memarchive",
+        "!memrestore", "!memdelete", "!durable", "!durableadd",
+        "!durableedit", "!durabledelete", "!people", "!person",
+        "!consolidate", "!personreload",
+    }
+    if command not in managed:
+        return False
+    if not is_command_owner(message):
+        return True
+
+    scope_id = memory_scope_for(message)
+
+    if command == "!memories":
+        count = safe_int(rest.strip() or "20", 20, 1, 50)
+        rows = await memory_manager.list_memories(scope_id, count)
+        if not rows:
+            await message.reply("No episodic memories yet.", mention_author=False)
+            return True
+        blocks = [
+            f"**#{row['id']}** [{row['status']}] [sig {row['significance']}] "
+            f"[#{row.get('channel_name') or '?'}]\\n{row['content']}"
+            for row in rows
+        ]
+        await send_command_chunks(message, "**EPISODIC MEMORIES**\\n\\n" + "\\n\\n".join(blocks))
+        return True
+
+    if command == "!memsearch":
+        query = rest.strip()
+        if not query:
+            await message.reply("Usage: `!memsearch words`", mention_author=False)
+            return True
+        rows = await memory_manager.search_memories(scope_id, query, 20)
+        if not rows:
+            await message.reply("No matching memories.", mention_author=False)
+            return True
+        blocks = [
+            f"**#{row['id']}** [{row['status']}] [sig {row['significance']}]\\n{row['content']}"
+            for row in rows
+        ]
+        await send_command_chunks(message, f"**MEMORY SEARCH: {query}**\\n\\n" + "\\n\\n".join(blocks))
+        return True
+
+    if command == "!memedit":
+        bits = rest.split(maxsplit=1)
+        if len(bits) != 2 or not bits[0].isdigit():
+            await message.reply("Usage: `!memedit ID replacement text`", mention_author=False)
+            return True
+        ok = await memory_manager.edit_memory(scope_id, int(bits[0]), bits[1].strip())
+        await message.reply("Edited." if ok else "Memory ID not found.", mention_author=False)
+        return True
+
+    if command in {"!memarchive", "!memrestore", "!memdelete"}:
+        if not rest.strip().isdigit():
+            await message.reply(f"Usage: `{command} ID`", mention_author=False)
+            return True
+        memory_id = int(rest.strip())
+        if command == "!memarchive":
+            ok = await memory_manager.set_memory_status(scope_id, memory_id, "archived", "manually archived")
+        elif command == "!memrestore":
+            ok = await memory_manager.set_memory_status(scope_id, memory_id, "active")
+        else:
+            ok = await memory_manager.delete_memory(scope_id, memory_id)
+        await message.reply("Done." if ok else "Memory ID not found.", mention_author=False)
+        return True
+
+    if command == "!durable":
+        rows = await memory_manager.get_durable_memories(scope_id)
+        if not rows:
+            await message.reply("No durable memories yet.", mention_author=False)
+            return True
+        blocks = []
+        for row in rows:
+            pin = " PINNED" if row.get("pinned") else ""
+            blocks.append(f"**D#{row['id']}** [{row['category']}{pin}]\\n{row['content']}")
+        await send_command_chunks(message, "**DURABLE MEMORY**\\n\\n" + "\\n\\n".join(blocks))
+        return True
+
+    if command == "!durableadd":
+        category, sep, durable_text = rest.partition("|")
+        if not sep or not durable_text.strip():
+            await message.reply("Usage: `!durableadd category | fact to preserve`", mention_author=False)
+            return True
+        durable_id = await memory_manager.add_durable(
+            scope_id, category.strip() or "general", durable_text.strip(), pinned=True
+        )
+        await message.reply(f"Added pinned durable memory D#{durable_id}.", mention_author=False)
+        return True
+
+    if command == "!durableedit":
+        bits = rest.split(maxsplit=1)
+        if len(bits) != 2 or not bits[0].isdigit():
+            await message.reply("Usage: `!durableedit ID replacement text`", mention_author=False)
+            return True
+        ok = await memory_manager.edit_durable(scope_id, int(bits[0]), bits[1].strip())
+        await message.reply("Edited and pinned." if ok else "Durable ID not found.", mention_author=False)
+        return True
+
+    if command == "!durabledelete":
+        if not rest.strip().isdigit():
+            await message.reply("Usage: `!durabledelete ID`", mention_author=False)
+            return True
+        ok = await memory_manager.delete_durable(scope_id, int(rest.strip()))
+        await message.reply("Deleted." if ok else "Durable ID not found.", mention_author=False)
+        return True
+
+    if command == "!people":
+        names = ", ".join(card["name"] for card in memory_manager.people_cache)
+        await send_command_chunks(message, f"**PEOPLE CARDS ({len(memory_manager.people_cache)})**\\n{names}")
+        return True
+
+    if command == "!person":
+        query = rest.strip()
+        if not query:
+            await message.reply("Usage: `!person name-or-discord-id`", mention_author=False)
+            return True
+        cards = await memory_manager.get_person(query)
+        if not cards:
+            await message.reply("No matching person card.", mention_author=False)
+            return True
+        await send_command_chunks(message, "**PERSON CARD**\\n\\n" + memory_manager.format_people_context(cards))
+        return True
+
+    if command == "!personreload":
+        await memory_manager.reload_people_cards()
+        await message.reply(
+            f"Reloaded {len(memory_manager.people_cache)} cards from `{PEOPLE_CARDS_PATH}`.",
+            mention_author=False,
+        )
+        return True
+
+    if command == "!consolidate":
+        await message.reply("Running a full memory consolidation pass…", mention_author=False)
+        result = await consolidate_scope_safe(scope_id, force_full=True)
+        await message.reply(f"Consolidation finished: `{result}`", mention_author=False)
+        return True
+
+    return False
+
+
 async def handle_memories_command(message: discord.Message) -> bool:
     content = (message.content or "").strip()
     if not content.lower().startswith("!memories"):
@@ -1129,10 +1363,13 @@ async def handle_memory_context_command(message: discord.Message) -> bool:
 
     recent_text = format_memories(list(reversed(recent_memory_rows)))
     retrieved_text = format_memories(retrieved_rows, include_channel=True)
+    durable_rows = await memory_manager.get_durable_memories(scope_id)
+    durable_text = memory_manager.format_durable_memories(durable_rows)
 
     text = (
-        f"**RECENT MEMORIES ({len(recent_memory_rows)})**\n{recent_text}\n\n"
-        f"**RETRIEVED MEMORIES / RAG ({len(retrieved_rows)})**\n{retrieved_text}"
+        f"**DURABLE MEMORIES ({len(durable_rows)})**\n{durable_text}\n\n"
+        f"**RECENT EPISODES ({len(recent_memory_rows)})**\n{recent_text}\n\n"
+        f"**RETRIEVED EPISODES / RAG ({len(retrieved_rows)})**\n{retrieved_text}"
     )
 
     while text:
@@ -1161,11 +1398,35 @@ async def build_memory_query(
         chunks.append(current_message_text[:2200])
 
     for row in background_rows[-2:]:
-        content = (row["content"] or "").strip()
+        content = memory_manager.resolve_mentions((row["content"] or "").strip())
         if content:
             chunks.append(content[:800])
 
     return " ".join(chunks)[:4000].strip()
+
+
+async def consolidate_scope_safe(scope_id: str, force_full: bool = False):
+    lock = consolidation_locks.setdefault(scope_id, asyncio.Lock())
+    async with lock:
+        try:
+            result = await memory_manager.consolidate_scope(scope_id, force_full=force_full)
+            if result.get("ran"):
+                print(f"Memory consolidation for {scope_id}: {result}")
+            return result
+        except Exception as exc:
+            print(f"Memory consolidation failed for {scope_id}: {repr(exc)}")
+            return {"ran": False, "error": repr(exc)}
+
+
+async def initial_consolidation_pass():
+    scopes = await memory_manager.list_scopes()
+    for scope_id in scopes:
+        await consolidate_scope_safe(scope_id)
+
+
+def schedule_consolidation(scope_id: str):
+    if AUTO_CONSOLIDATE:
+        asyncio.create_task(consolidate_scope_safe(scope_id))
 
 
 def proactive_target_minute(local_date, channel_id: str) -> int:
@@ -1180,6 +1441,7 @@ def proactive_target_minute(local_date, channel_id: str) -> int:
 
 async def send_proactive_turn(channel):
     channel_id = str(channel.id)
+    scope_id = memory_scope_for_channel(channel)
 
     # Same text/memory machinery as a normal turn, except there is deliberately
     # no fake Discord user message.
@@ -1197,6 +1459,9 @@ async def send_proactive_turn(channel):
     )
     recent_memory_ids = [row["id"] for row in recent_memory_rows]
     recent_memory_text = format_memories(list(reversed(recent_memory_rows)))
+    durable_rows = await memory_manager.get_durable_memories(scope_id)
+    durable_memory_text = memory_manager.format_durable_memories(durable_rows)
+
 
     proactive_current = (
         f"{COMPANION_NAME}: You have chosen to make an unsolicited post in this channel. "
@@ -1221,10 +1486,22 @@ async def send_proactive_turn(channel):
     reference_images, has_canonical = await build_reference_images(channel_id)
     external_images = await build_proactive_external_images(channel)
 
+    recent_author_ids = [str(row["author_id"]) for row in recent_rows[-3:]]
+    external_author_ids = [item["author_id"] for item in external_images]
+    relevant_people = memory_manager.select_relevant_people(
+        author_id=None,
+        text=recent_background_text,
+        extra_ids=recent_author_ids + external_author_ids,
+        exclude_ids=[str(bot.user.id)] if bot.user else [],
+    )
+    people_context_text = memory_manager.format_people_context(relevant_people)
+
     async with channel.typing():
         image_bytes, prompt_used = await engine.generate_image(
             current_message_text=proactive_current,
+            people_context_text=people_context_text,
             recent_background_text=recent_background_text,
+            durable_memory_text=durable_memory_text,
             recent_memory_text=recent_memory_text,
             retrieved_memory_text=retrieved_memory_text,
             reference_images=reference_images,
@@ -1244,36 +1521,51 @@ async def send_proactive_turn(channel):
         helper_context = (
             "PROACTIVE SELF-INITIATED TURN:\n"
             + proactive_current
+            + "\n\nPEOPLE RELEVANT TO THIS TURN:\n"
+            + people_context_text
             + "\n\nRECENT CHANNEL CONTEXT:\n"
             + recent_background_text
+        )
+        existing_memory_context = (
+            "DURABLE MEMORY:\n"
+            + durable_memory_text
+            + "\n\nRECENT EPISODES:\n"
+            + recent_memory_text
+            + "\n\nRETRIEVED EPISODES:\n"
+            + retrieved_memory_text
         )
         summary = await engine.summarize_image_to_memory(
             image_bytes=image_bytes,
             recent_messages_text=helper_context,
+            existing_memory_context=existing_memory_context,
         )
     except Exception as exc:
         print(f"Proactive memory helper failed: {repr(exc)}")
         summary = {
-            "memory": "I chose to post an image in the channel on my own.",
+            "save": False,
+            "memory": "",
             "significance": 1,
         }
 
-    await storage.save_output_and_memory(
-        scope_id=memory_scope_for_channel(channel),
+    memory_id = await storage.save_output_and_memory(
+        scope_id=scope_id,
         channel_id=channel_id,
         channel_name=getattr(channel, "name", channel_id),
         discord_message_id=str(sent.id),
         attachment_url=attachment_url,
         prompt_used=prompt_used,
         image_bytes=image_bytes,
-        memory=summary["memory"],
+        memory=summary["memory"] if summary.get("save") else None,
         significance=summary["significance"],
         keep_recent_images=RECENT_IMAGE_TURNS,
     )
 
+    if memory_id:
+        schedule_consolidation(scope_id)
+
     print(
         f"Proactive post sent in channel {channel_id} "
-        f"(significance {summary['significance']})."
+        f"(memory {'saved' if memory_id else 'skipped as duplicate/routine'})."
     )
 
 
@@ -1372,8 +1664,12 @@ async def proactive_loop():
 
 @bot.event
 async def on_ready():
-    global proactive_loop_task
+    global proactive_loop_task, initial_consolidation_task
     print(f"Logged in as {bot.user} ({bot.user.id if bot.user else 'unknown'})")
+    if AUTO_CONSOLIDATE:
+        if initial_consolidation_task is None or initial_consolidation_task.done():
+            initial_consolidation_task = asyncio.create_task(initial_consolidation_pass())
+
     if PROACTIVE_ENABLED and PROACTIVE_CHANNEL_IDS:
         if proactive_loop_task is None or proactive_loop_task.done():
             proactive_loop_task = asyncio.create_task(proactive_loop())
@@ -1385,6 +1681,8 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     # Debug/admin commands: do not add the command itself to companion context.
+    if await handle_memory_admin_command(message):
+        return
     if await handle_dbwhere_command(message):
         return
     if await handle_memories_command(message):
@@ -1468,6 +1766,9 @@ async def handle_turn(message: discord.Message):
     )
     recent_memory_ids = [row["id"] for row in recent_memory_rows]
     recent_memory_text = format_memories(list(reversed(recent_memory_rows)))
+    durable_rows = await memory_manager.get_durable_memories(scope_id)
+    durable_memory_text = memory_manager.format_durable_memories(durable_rows)
+
 
     # Then retrieve older relevant memories, excluding anything already present
     # in the recent-memory block so the two sections remain genuinely distinct.
@@ -1487,6 +1788,14 @@ async def handle_turn(message: discord.Message):
     # external_images = newest images humans/other AI have shown in this channel/thread
     external_images = await build_external_conversation_images(message)
 
+    relevant_people = memory_manager.select_relevant_people(
+        author_id=str(message.author.id),
+        text=message.content or "",
+        extra_ids=[item["author_id"] for item in external_images],
+        exclude_ids=[str(bot.user.id)] if bot.user else [],
+    )
+    people_context_text = memory_manager.format_people_context(relevant_people)
+
     if external_images:
         print(
             "External conversation images this turn: "
@@ -1499,7 +1808,9 @@ async def handle_turn(message: discord.Message):
     async with message.channel.typing():
         image_bytes, prompt_used = await engine.generate_image(
             current_message_text=current_message_text,
+            people_context_text=people_context_text,
             recent_background_text=recent_background_text,
+            durable_memory_text=durable_memory_text,
             recent_memory_text=recent_memory_text,
             retrieved_memory_text=retrieved_memory_text,
             reference_images=reference_images,
@@ -1539,21 +1850,33 @@ async def handle_turn(message: discord.Message):
         helper_context = (
             "CURRENT MESSAGE:\n"
             + current_message_text
+            + "\n\nPEOPLE RELEVANT TO THIS TURN:\n"
+            + people_context_text
             + "\n\nIMMEDIATE BACKGROUND:\n"
             + recent_background_text
+        )
+        existing_memory_context = (
+            "DURABLE MEMORY:\n"
+            + durable_memory_text
+            + "\n\nRECENT EPISODES:\n"
+            + recent_memory_text
+            + "\n\nRETRIEVED EPISODES:\n"
+            + retrieved_memory_text
         )
         summary = await engine.summarize_image_to_memory(
             image_bytes=image_bytes,
             recent_messages_text=helper_context,
+            existing_memory_context=existing_memory_context,
         )
     except Exception as exc:
         print(f"Memory helper failed: {repr(exc)}")
         summary = {
-            "memory": "I replied with an image.",
+            "save": False,
+            "memory": "",
             "significance": 1,
         }
 
-    await storage.save_output_and_memory(
+    memory_id = await storage.save_output_and_memory(
         scope_id=scope_id,
         channel_id=channel_id,
         channel_name=channel_name,
@@ -1561,15 +1884,19 @@ async def handle_turn(message: discord.Message):
         attachment_url=attachment_url,
         prompt_used=prompt_used,
         image_bytes=image_bytes,
-        memory=summary["memory"],
+        memory=summary["memory"] if summary.get("save") else None,
         significance=summary["significance"],
         keep_recent_images=RECENT_IMAGE_TURNS,
     )
 
-    print(
-        f"Saved memory for {scope_id} / channel {channel_id} "
-        f"(significance {summary['significance']}): {summary['memory']}"
-    )
+    if memory_id:
+        print(
+            f"Saved episodic memory #{memory_id} for {scope_id} / channel {channel_id} "
+            f"(significance {summary['significance']}): {summary['memory']}"
+        )
+        schedule_consolidation(scope_id)
+    else:
+        print(f"Skipped duplicate/routine memory for {scope_id} / channel {channel_id}.")
 
 
 async def main():

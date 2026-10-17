@@ -1,0 +1,19 @@
+Image-san v8
+
+Added:
+- CANONICAL_REFERENCE_PATH local-file support
+- GIF/JPEG/WEBP/etc. normalization to PNG
+- !dbwhere owner-only database diagnostic
+- keeps v7 AI reply pings / loop breaker / external conversation images
+
+To give San a reference:
+1. Put your chosen image in the GitHub repo beside bot.py.
+2. Rename it, for example: image_san_reference.png
+3. Set Railway:
+   CANONICAL_REFERENCE_PATH=image_san_reference.png
+
+Owner diagnostic:
+!dbwhere
+
+Expected San output currently:
+schema: public
