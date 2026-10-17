@@ -1153,7 +1153,7 @@ async def handle_memory_admin_command(message: discord.Message) -> bool:
         "!memories", "!memsearch", "!memedit", "!memarchive",
         "!memrestore", "!memdelete", "!durable", "!durableadd",
         "!durableedit", "!durabledelete", "!people", "!person",
-        "!consolidate", "!personreload",
+        "!consolidate", "!memoryrepair", "!personreload",
     }
     if command not in managed:
         return False
@@ -1170,10 +1170,10 @@ async def handle_memory_admin_command(message: discord.Message) -> bool:
             return True
         blocks = [
             f"**#{row['id']}** [{row['status']}] [sig {row['significance']}] "
-            f"[#{row.get('channel_name') or '?'}]\\n{row['content']}"
+            f"[#{row.get('channel_name') or '?'}]\n{row['content']}"
             for row in rows
         ]
-        await send_command_chunks(message, "**EPISODIC MEMORIES**\\n\\n" + "\\n\\n".join(blocks))
+        await send_command_chunks(message, "**EPISODIC MEMORIES**\n\n" + "\n\n".join(blocks))
         return True
 
     if command == "!memsearch":
@@ -1186,10 +1186,10 @@ async def handle_memory_admin_command(message: discord.Message) -> bool:
             await message.reply("No matching memories.", mention_author=False)
             return True
         blocks = [
-            f"**#{row['id']}** [{row['status']}] [sig {row['significance']}]\\n{row['content']}"
+            f"**#{row['id']}** [{row['status']}] [sig {row['significance']}]\n{row['content']}"
             for row in rows
         ]
-        await send_command_chunks(message, f"**MEMORY SEARCH: {query}**\\n\\n" + "\\n\\n".join(blocks))
+        await send_command_chunks(message, f"**MEMORY SEARCH: {query}**\n\n" + "\n\n".join(blocks))
         return True
 
     if command == "!memedit":
@@ -1223,8 +1223,8 @@ async def handle_memory_admin_command(message: discord.Message) -> bool:
         blocks = []
         for row in rows:
             pin = " PINNED" if row.get("pinned") else ""
-            blocks.append(f"**D#{row['id']}** [{row['category']}{pin}]\\n{row['content']}")
-        await send_command_chunks(message, "**DURABLE MEMORY**\\n\\n" + "\\n\\n".join(blocks))
+            blocks.append(f"**D#{row['id']}** [{row['category']}{pin}]\n{row['content']}")
+        await send_command_chunks(message, "**DURABLE MEMORY**\n\n" + "\n\n".join(blocks))
         return True
 
     if command == "!durableadd":
@@ -1257,7 +1257,7 @@ async def handle_memory_admin_command(message: discord.Message) -> bool:
 
     if command == "!people":
         names = ", ".join(card["name"] for card in memory_manager.people_cache)
-        await send_command_chunks(message, f"**PEOPLE CARDS ({len(memory_manager.people_cache)})**\\n{names}")
+        await send_command_chunks(message, f"**PEOPLE CARDS ({len(memory_manager.people_cache)})**\n{names}")
         return True
 
     if command == "!person":
@@ -1269,7 +1269,7 @@ async def handle_memory_admin_command(message: discord.Message) -> bool:
         if not cards:
             await message.reply("No matching person card.", mention_author=False)
             return True
-        await send_command_chunks(message, "**PERSON CARD**\\n\\n" + memory_manager.format_people_context(cards))
+        await send_command_chunks(message, "**PERSON CARD**\n\n" + memory_manager.format_people_context(cards))
         return True
 
     if command == "!personreload":
@@ -1284,6 +1284,21 @@ async def handle_memory_admin_command(message: discord.Message) -> bool:
         await message.reply("Running a full memory consolidation pass…", mention_author=False)
         result = await consolidate_scope_safe(scope_id, force_full=True)
         await message.reply(f"Consolidation finished: `{result}`", mention_author=False)
+        return True
+
+    if command == "!memoryrepair":
+        await message.reply(
+            "Rebuilding automatic durable memory with identity-sanitisation. "
+            "Pinned durable memories and original episodes will not be deleted.",
+            mention_author=False,
+        )
+        cleared = await memory_manager.clear_automatic_durable(scope_id)
+        result = await consolidate_scope_safe(scope_id, force_full=True)
+        await message.reply(
+            f"Memory repair finished. Cleared `{cleared}` automatic durable memories. "
+            f"Repair result: `{result}`",
+            mention_author=False,
+        )
         return True
 
     return False
@@ -1519,6 +1534,8 @@ async def send_proactive_turn(channel):
 
     try:
         helper_context = (
+            "MEMORY OWNER: " + COMPANION_NAME + ". "
+            "Write autobiographical memory only for this companion, not for another person depicted or mentioned.\n\n"
             "PROACTIVE SELF-INITIATED TURN:\n"
             + proactive_current
             + "\n\nPEOPLE RELEVANT TO THIS TURN:\n"
@@ -1848,6 +1865,8 @@ async def handle_turn(message: discord.Message):
 
     try:
         helper_context = (
+            "MEMORY OWNER: " + COMPANION_NAME + ". "
+            "Write autobiographical memory only for this companion, not for another person depicted or mentioned.\n\n"
             "CURRENT MESSAGE:\n"
             + current_message_text
             + "\n\nPEOPLE RELEVANT TO THIS TURN:\n"

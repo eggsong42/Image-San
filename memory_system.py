@@ -139,6 +139,15 @@ Rules:
 - Do not archive distinctive events, promises, first meetings, relationship changes, milestones, or memorable one-off interactions unless they are genuinely redundant copies.
 - Pinned durable memories are outside your editable set and must remain untouched.
 - Avoid duplicate automatic durable memories.
+
+IDENTITY SANITATION:
+- Historical memory may contain cross-companion contamination from an older database configuration.
+- SELF IDENTITY below is authoritative for whose autobiographical memory this is.
+- If an episodic memory uses first-person language to claim the companion IS another named person/companion, or assigns the self an obviously incompatible identity/relationship (for example "I am Jett" inside Image-san's memory, or "Image-san is my creator" inside Image-san's own autobiographical memory), treat that episode as FOREIGN CONTAMINATION.
+- Foreign-contamination episodes must NEVER become durable memory. Put their IDs in archive_ids.
+- A legitimate memory ABOUT another person is not foreign contamination when the companion is clearly the observer/participant (for example "I met Jett" or "I drew Megan").
+- Existing AUTOMATIC DURABLE MEMORIES may themselves be contaminated. Omit any automatic durable item that clearly belongs to another person's first-person identity.
+- Appearance can legitimately vary, so do not mark a memory foreign solely because clothing, form, or art style differs. Use names, first-person identity claims, relationships, creator/partner roles, and strong contextual contradictions as the main evidence.
 """.strip()
 
 
@@ -682,6 +691,54 @@ class MemoryManager:
                 ids,
             )
 
+    def self_identity_context(self) -> str:
+        """Compact authoritative grounding for autobiographical ownership."""
+        own = None
+        wanted = self.companion_name.casefold().replace("_", "-")
+        for card in self.people_cache:
+            card_name = str(card.get("name") or "").casefold().replace("_", "-")
+            aliases = [
+                str(alias).casefold().replace("_", "-")
+                for alias in (card.get("aliases") or [])
+            ]
+            if card_name == wanted or wanted in aliases:
+                own = card
+                break
+
+        if own:
+            return (
+                f"Name: {own['name']}\n"
+                f"Appearance: {own.get('appearance') or '-'}\n"
+                f"Relationship: {own.get('relationship') or '-'}\n"
+                f"Notes: {own.get('notes') or '-'}"
+            )
+
+        return f"Name: {self.companion_name}"
+
+    def known_people_names(self) -> str:
+        names = [
+            str(card.get("name") or "").strip()
+            for card in self.people_cache
+            if str(card.get("name") or "").strip()
+        ]
+        return ", ".join(names)
+
+    async def clear_automatic_durable(self, scope_id: str) -> int:
+        """Delete only machine-generated durable memory; pinned human edits survive."""
+        async with self.storage.connection() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM durable_memories
+                WHERE scope_id = $1
+                  AND pinned = FALSE
+                """,
+                scope_id,
+            )
+        try:
+            return int(result.split()[-1])
+        except Exception:
+            return 0
+
     async def _call_consolidator(
         self,
         scope_id: str,
@@ -729,6 +786,8 @@ class MemoryManager:
                             "type": "input_text",
                             "text": (
                                 f"Companion: {self.companion_name}\n\n"
+                                f"SELF IDENTITY — AUTHORITATIVE:\n{self.self_identity_context()}\n\n"
+                                f"KNOWN PEOPLE / OTHER POSSIBLE IDENTITIES:\n{self.known_people_names()}\n\n"
                                 f"PINNED DURABLE MEMORIES:\n{pinned_text}\n\n"
                                 f"AUTOMATIC DURABLE MEMORIES:\n{automatic_text}\n\n"
                                 f"EPISODIC MEMORIES:\n{episode_text}"
