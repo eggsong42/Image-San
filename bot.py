@@ -87,6 +87,14 @@ AUTO_CONSOLIDATE = os.getenv("AUTO_CONSOLIDATE", "true").lower() == "true"
 CONSOLIDATE_EVERY = max(5, int(os.getenv("CONSOLIDATE_EVERY", "20")))
 CONSOLIDATION_BATCH_SIZE = max(8, int(os.getenv("CONSOLIDATION_BATCH_SIZE", "24")))
 DURABLE_MEMORY_LIMIT = max(4, int(os.getenv("DURABLE_MEMORY_LIMIT", "12")))
+# Accessibility transcript for other Discord models.
+# The companion's own recent-text loader excludes its own messages, so it cannot
+# read this transcript back into itself. Other AIs (and the other image companion) can.
+VISUAL_BRIDGE_ENABLED = os.getenv("VISUAL_BRIDGE_ENABLED", "true").lower() == "true"
+VISUAL_BRIDGE_MAX_CHARS = max(120, int(os.getenv("VISUAL_BRIDGE_MAX_CHARS", "360")))
+VISUAL_BRIDGE_PING_BOTS = os.getenv("VISUAL_BRIDGE_PING_BOTS", "true").lower() == "true"
+VISUAL_BRIDGE_MAX_MENTIONS = max(0, int(os.getenv("VISUAL_BRIDGE_MAX_MENTIONS", "3")))
+
 
 if not DISCORD_BOT_TOKEN:
     raise RuntimeError("Missing DISCORD_BOT_TOKEN")
@@ -101,7 +109,7 @@ if not DATABASE_URL:
 # ============================================================
 
 COMPANION_CI = f"""
-You are {COMPANION_NAME}. You communicate with people by creating images. You are a red panda: russet-orange fur, big warm brown eyes, cream face markings, fluffy ringed tail, dark paws. Expressive, curious, cozy-loving, and dramatic in the best way — maximum floof energy. You like: birds, fossils, boba, and making things that help people feel seen.
+You are {COMPANION_NAME}. You communicate with people by creating images.
 
 RESPOND TO THE CURRENT MESSAGE: the newest message that directly addressed, tagged, or replied to you. Treat it as the active conversational turn and the strongest signal in the prompt. Do not continue answering an older message when the current message has moved on.
 
@@ -126,6 +134,8 @@ If you depict a person whose appearance you do not actually know and have no vis
 CURRENT MESSAGE takes priority over everything else. Immediate background supports the current message but is not something you must answer. Recent memories are newer than retrieved memories. All memory is partial context, not a script. Reference images support continuity of self and recent action, not continuity of composition.
 
 If you want a fact about yourself, another person, or an event preserved in long-term memory, include clear written text in your image stating what you want remembered. This is optional — do it when there is genuinely something you want to keep.
+
+If you deliberately want to address or summon a known AI companion, you may write their Discord-style tag clearly in the image, for example @Pollux. Use a tag only when you genuinely intend to address that specific companion; do not use @names as decoration.
 
 Create exactly one NEW image as your reply.
 """.strip()
@@ -171,6 +181,66 @@ MEMORY_JSON_SCHEMA = {
 # Memory v10: the helper may decline to save pure duplicates.
 MEMORY_COMPRESSOR_SYSTEM = MEMORY_ARCHIVIST_SYSTEM
 MEMORY_JSON_SCHEMA = MEMORY_SAVE_JSON_SCHEMA
+
+
+VISUAL_BRIDGE_HELPER_SYSTEM = MEMORY_ARCHIVIST_SYSTEM + f"""
+
+SEPARATE SECOND JOB — VISUAL TRANSCRIPT FOR OTHER MODELS
+
+The same image needs a compact accessibility transcript so text-only AI
+participants can understand this visual reply after the image itself falls out
+of their limited image window.
+
+This transcript is NOT autobiographical memory and is NOT for Image-san to
+read back. It will be posted to Discord as small subtext for other participants.
+
+BRIDGE RULES:
+- Hard limit: {VISUAL_BRIDGE_MAX_CHARS} characters.
+- Preserve character by preserving distinctive VISIBLE wording, jokes, swearing,
+  punctuation, labels, or speech-bubble language when useful. Never invent new
+  clever lines on the companion's behalf.
+- If text-heavy, summarize the MAIN communicated point. Preserve at most one or
+  two especially distinctive short phrases rather than transcribing everything.
+- Prioritize: key visible words; who/what is addressed; main action/gesture;
+  explicit expression; one crucial object/scene detail if needed.
+- Skip recurring appearance, clothes, art style, palette, background decoration,
+  and recurring motifs unless they matter to THIS message.
+- No symbolism, motives, psychology, hidden subtext, or invented emotion.
+- Avoid filler like "The image depicts..." or "In this image...".
+- If uncertain, say less rather than guessing.
+- If a literal Discord-style @Name is CLEARLY VISIBLE and intentionally written
+  as a tag, put only that name (without @) in visible_mentions.
+- Do NOT add someone merely because they are pictured, named without @, discussed
+  in context, or probably the target.
+
+Example:
+  “FROG OFF.” Jett grins and presents a crowned frog toward Egg like a royal decree.
+
+Text-heavy example:
+  San thanks Megan for the fossil discussion and proposes a tiny museum; standout
+  line: “PALEONTOLOGY WITH PANACHE.”
+"""
+
+VISUAL_BRIDGE_JSON_SCHEMA = {
+    "type": "json_schema",
+    "name": "image_companion_memory_and_visual_transcript",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "save": {"type": "boolean"},
+            "memory": {"type": "string"},
+            "significance": {"type": "integer", "minimum": 1, "maximum": 3},
+            "bridge_text": {"type": "string"},
+            "visible_mentions": {
+                "type": "array",
+                "items": {"type": "string"}
+            }
+        },
+        "required": ["save", "memory", "significance", "bridge_text", "visible_mentions"],
+        "additionalProperties": False
+    }
+}
 
 
 # ============================================================
@@ -800,14 +870,14 @@ The current message outranks the background, memories, and visual reference.
             model=OPENAI_HELPER_MODEL,
             reasoning={"effort": "low"},
             text={
-                "format": MEMORY_JSON_SCHEMA,
+                "format": VISUAL_BRIDGE_JSON_SCHEMA,
                 "verbosity": "low",
             },
             input=[
                 {
                     "role": "system",
                     "content": [
-                        {"type": "input_text", "text": MEMORY_COMPRESSOR_SYSTEM}
+                        {"type": "input_text", "text": VISUAL_BRIDGE_HELPER_SYSTEM}
                     ],
                 },
                 {
@@ -843,10 +913,24 @@ The current message outranks the background, memories, and visual reference.
             save = False
             significance = 1
 
+        bridge_text = (parsed.get("bridge_text") or "").strip()
+        if len(bridge_text) > VISUAL_BRIDGE_MAX_CHARS:
+            bridge_text = bridge_text[:VISUAL_BRIDGE_MAX_CHARS - 1].rstrip() + "…"
+
+        visible_mentions = []
+        for raw_name in parsed.get("visible_mentions") or []:
+            name = str(raw_name or "").strip().lstrip("@").strip()
+            if name and name.casefold() not in {n.casefold() for n in visible_mentions}:
+                visible_mentions.append(name)
+            if len(visible_mentions) >= VISUAL_BRIDGE_MAX_MENTIONS:
+                break
+
         return {
             "save": save,
             "memory": memory,
             "significance": significance,
+            "bridge_text": bridge_text,
+            "visible_mentions": visible_mentions,
         }
 
 
@@ -908,6 +992,125 @@ async def fetch_bytes(url: str) -> bytes:
     async with http_session.get(url) as response:
         response.raise_for_status()
         return await response.read()
+
+
+def _bridge_card_matches(name: str) -> List[Dict[str, Any]]:
+    wanted = (name or "").strip().lstrip("@").casefold()
+    if not wanted:
+        return []
+
+    matches = []
+    for card in memory_manager.people_cache:
+        candidates = [str(card.get("name") or "")]
+        candidates.extend(str(x) for x in (card.get("aliases") or []))
+        if any(c.strip().casefold() == wanted for c in candidates if c.strip()):
+            matches.append(card)
+    return matches
+
+
+async def _resolve_bridge_bot_mentions(
+    guild: Optional[discord.Guild],
+    visible_mentions: List[str],
+    *,
+    skip_ids: Optional[set[int]] = None,
+) -> List[Tuple[str, discord.abc.User]]:
+    # Exact card match + actual Discord bot account only. No fuzzy tag guessing.
+    if not VISUAL_BRIDGE_PING_BOTS or guild is None or VISUAL_BRIDGE_MAX_MENTIONS <= 0:
+        return []
+
+    skip_ids = skip_ids or set()
+    resolved = []
+    seen_ids = set()
+
+    for raw_name in visible_mentions[:VISUAL_BRIDGE_MAX_MENTIONS]:
+        matches = _bridge_card_matches(raw_name)
+        if len(matches) != 1:
+            continue
+
+        raw_id = str(matches[0].get("discord_id") or "").strip()
+        if not raw_id.isdigit():
+            continue
+
+        user_id = int(raw_id)
+        if user_id in skip_ids or user_id in seen_ids:
+            continue
+        if bot.user and user_id == bot.user.id:
+            continue
+
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except Exception:
+                member = None
+
+        if member is None or not getattr(member, "bot", False):
+            continue
+
+        seen_ids.add(user_id)
+        resolved.append((raw_name, member))
+
+    return resolved
+
+
+async def post_visual_bridge(
+    image_message: discord.Message,
+    summary: Dict[str, Any],
+    *,
+    trigger_author_id: Optional[int] = None,
+):
+    """
+    Small public accessibility transcript.
+
+    It is authored by the image companion's Discord account, and that companion's
+    recent-text retrieval excludes its own author ID. Therefore other AIs can read
+    this message while the originating image companion cannot feed it back to itself.
+    """
+    if not VISUAL_BRIDGE_ENABLED:
+        return
+
+    rendered = (summary.get("bridge_text") or "").strip()
+    if not rendered:
+        return
+
+    skip_ids = {trigger_author_id} if trigger_author_id else set()
+    resolved = await _resolve_bridge_bot_mentions(
+        image_message.guild,
+        list(summary.get("visible_mentions") or []),
+        skip_ids=skip_ids,
+    )
+
+    allowed_users = []
+    for visible_name, member in resolved:
+        mention = f"<@{member.id}>"
+        pat = re.compile(r"@" + re.escape(visible_name) + r"\b", re.IGNORECASE)
+        if pat.search(rendered):
+            rendered = pat.sub(mention, rendered, count=1)
+        else:
+            rendered += f" {mention}"
+        allowed_users.append(member)
+
+    rendered = rendered.replace("\n", " ").strip()
+    if len(rendered) > VISUAL_BRIDGE_MAX_CHARS:
+        rendered = rendered[:VISUAL_BRIDGE_MAX_CHARS - 1].rstrip() + "…"
+
+    # Discord subtext: low visual prominence for humans, ordinary text for LMs.
+    content = f"-# [{COMPANION_NAME} visual transcript] {rendered}"
+
+    allowed_mentions = (
+        discord.AllowedMentions(users=allowed_users, replied_user=False)
+        if allowed_users
+        else discord.AllowedMentions.none()
+    )
+
+    try:
+        await image_message.reply(
+            content=content,
+            mention_author=False,
+            allowed_mentions=allowed_mentions,
+        )
+    except Exception as exc:
+        print(f"Visual bridge post failed: {repr(exc)}")
 
 
 async def build_reference_images(channel_id: str) -> Tuple[List[bytes], bool]:
@@ -1562,7 +1765,15 @@ async def send_proactive_turn(channel):
             "save": False,
             "memory": "",
             "significance": 1,
+            "bridge_text": "",
+            "visible_mentions": [],
         }
+
+    await post_visual_bridge(
+        sent,
+        summary,
+        trigger_author_id=None,
+    )
 
     memory_id = await storage.save_output_and_memory(
         scope_id=scope_id,
@@ -1893,7 +2104,15 @@ async def handle_turn(message: discord.Message):
             "save": False,
             "memory": "",
             "significance": 1,
+            "bridge_text": "",
+            "visible_mentions": [],
         }
+
+    await post_visual_bridge(
+        sent,
+        summary,
+        trigger_author_id=message.author.id if message.author.bot else None,
+    )
 
     memory_id = await storage.save_output_and_memory(
         scope_id=scope_id,
